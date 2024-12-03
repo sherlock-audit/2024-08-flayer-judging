@@ -99,6 +99,75 @@ _Note: in the above the divisor is still unfixed, as this belongs to a different
 
 **Variant 2**: If compound interest is desired, employ either periodic per-second compounding, or continuous compounding with exponentiation. Any of these approaches are precise enough and much more gas efficient than the current one, but require substantial refactoring.
 
+
+
+## Discussion
+
+**kuprumxyz**
+
+For clarification of this finding impact (for future reference), I add here a some more data that I've demonstrated during the judging period.
+
+**Texted PoC: Unfair interest rate can be enforced on users**
+
+Suppose there are two collections, A and B, with the same utilization rate, i.e. the interest rate charged for them should be the same. A malicious user wants to inflict excess interest rate on the users of collection B, and repeatedly does `createListings` / `cancelListings` for an NFT from collection B. The only thing a malicious user loses is paying gas fees which are negligible; but the effect of the attack is that **all users of collection B pay up to `71\%` more interest rate than users of collection A**, though they should pay the same.
+
+Interest rate and compounded factor are calculated \_per collection\_, and all the logic described in this finding applies \_per collection\_. I.e. only the activity (or inactivity) per collection is relevant for the frequency-dependent calculation of interest rates. It may well be the case that some collections are used frequently, and the protocol may be perfectly healthy and well-working, but for infrequently used collections either users or the protocol suffer the losses described. 
+
+\#\# The updated coded PoC
+
+Some Watsons have raised a concern that the PoC supplied with the finding shows only the loss of 11\% if the [wrong divisor vulnerability](https://github.com/sherlock-audit/2024-08-flayer-judging/issues/98) is fixed. The point is that the PoC supplied with this finding is made specifically for the case when it's unfixed. It also employs 90\% utilization rate, and compares the principal sum + interest, instead of only the interest without principal sum, how it should be. Below we supply the updated PoC which addresses this.
+
+Please fix the [wrong divisor vulnerability](https://github.com/sherlock-audit/2024-08-flayer-judging/issues/98) as described, place the below PoC to [TaxCalculator.t.sol](https://github.com/sherlock-audit/2024-08-flayer/blob/main/flayer/test/TaxCalculator.t.sol\#L86), and execute with `forge test --match-test test\_WrongInterestCalculation`.
+
+```solidity
+ function test\_WrongInterestCalculation() public {
+  // We fix the utilization to 100\%
+  uint utilization = 1 ether;
+
+  // New checkpoints with the updated compoundedFactor are created 
+  // and stored whenever there is activity wrt. the collection
+
+  // The expected interest multiplier after 1 year
+  uint expectedFactor = 
+      taxCalculator.calculateCompoundedFactor(1 ether, utilization, 365 days);
+
+  // The resulting interest multiplier if some activity happens every day
+  uint compoundedFactor = 1 ether;
+  for (uint time = 0; time < 365 days; time += 1 days) {
+      compoundedFactor = 
+          taxCalculator.calculateCompoundedFactor(compoundedFactor, utilization, 1 days);
+  }
+
+  // User interest loss due to the activity which doesn't concern them is 71\%
+  // We subtract the principal (1 ether) as only the interests must to be compared.
+  assertApproxEqRel(
+      1.71 ether * (expectedFactor - 1 ether) / 1 ether,
+      compoundedFactor - 1 ether,
+      0.01 ether);
+ }
+```
+
+\#\# Interest losses calculations
+
+In order to settle the numerical questions once and for all, I've created [this spreadsheet](https://docs.google.com/spreadsheets/d/1Eze--nd0Nr0kt9HWEvo0Qbp8u9Gr9IdzwLU5g7-xHxc/edit?usp=sharing), which calculates both user and protocol losses depending on the frequency (the number of compounding intervals per year). The spreadsheet contains more data, but here is the excerpt from it, for 100\% interest rate:
+
+| Intervals per year  | Interest | Max interest | User interest loss | Protocol interest loss |
+| -------- | ------- | ------- | ------- | ------- | 
+| 1 (yearly)  | 100.00\%    | 171.83\% | 71.83\% | 41.80\% |
+| 4 (quarterly)  | 144.14\%    | 171.83\% | 19.21\% | 16.11\% |
+| 12 (monthly)  | 161.30\%    | 171.83\% |6.52\% | 6.13\% |
+| 52 (weekly)  | 169.26\%    | 171.83\% | 1.52\% | 1.49\% |
+| 365 (daily)  | 171.46\%    | 171.83\% | 0.22\% | 0.22\% |
+
+User losses are calculated under the assumption of the **PoC: Unfair interest rate can be enforced on users** supplied before, i.e. when a malicious user creates additional activity for the collection. Protocol losses don't require any attack, and happen by themselves, due to interest rates being frequency-dependent, and the relatively low collection activity.
+
+It can be seen that with weekly activity \_within a specific collection\_ (which is not an excessive limitation), the losses exceed 1\% which qualifies this finding to be [High severity](https://docs.sherlock.xyz/audits/real-time-judging/judging\#iv.-how-to-identify-a-high-issue):
+
+> Definite loss of funds without (extensive) limitations of external conditions. The loss of the affected party must exceed 1\%.
+
+Let me stress this again: Within a \_specific protocol\_ (one of many), with relevant NFT operations from a \_specific NFT collection\_ (this finding applies to each NFT collection separately, and only a small subset of NFTs from that collection will be employed within the protocol), moreover, concerning \_only listings\_ (which is a subset of the protocol functionality), \_weekly activity\_ (i.e. a listing for that collection being created or filled) is not an excessive limitation. NFTs are not the same market as fungible tokens (e.g. USDC, DAI, etc.): operations with them don't happen frequently.
+
+
 # Issue H-2: ERC1155Bridgable.sol cannot receive ETH royalties 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/140 
@@ -1509,6 +1578,8 @@ Adjust `tokenTaken` considering compounded factor in `ProtectedListings.adjustPo
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/405 
 
+The protocol has acknowledged this issue.
+
 ## Found by 
 Ali9955, Tendency, ZeroTrust, novaman33
 
@@ -1583,10 +1654,10 @@ Manual Review
 **zhaojio**
 
 We asked sponsor:
-> InfernalRiftBelow.claimRoyalties function of the msg.sender, is RELAYER_ADDRESS? right??
+> InfernalRiftBelow.claimRoyalties function of the msg.sender, is RELAYER\_ADDRESS? right??
 
 Sponsor reply:
-> good catch, it should be L2_CROSS_DOMAIN_MESSENGER instead
+> good catch, it should be L2\_CROSS\_DOMAIN\_MESSENGER instead
 
 # Issue H-13: InfernalRiftBelow.claimRoyalties no verification msg.sender 
 
@@ -1894,6 +1965,8 @@ Add a check inside the `relist` Function to prevent taxes being paid for listing
 # Issue H-17: ````UniswapImplementation.beforeSwap()```` is  vulnerable to price manipulation attack 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/559 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 AuditorPraise, BugPull, ComposableSecurity, KingNFT, Thanos, zzykxx
@@ -3477,6 +3550,8 @@ Use storage instead of memory for `poolParams` in [`setFee()`](https://github.co
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/202 
 
+The protocol has acknowledged this issue.
+
 ## Found by 
 ComposableSecurity, Spearmint, kuprum
 ### Summary
@@ -3706,6 +3781,8 @@ Add handling for refunding the leftover tokens.
 # Issue M-7: `ERC721Bridgable` and `ERC1155Bridgable` are not EIP-2981 compliant, and fail to correctly collect or attribute royalties to artists 
 
 Source: https://github.com/sherlock-audit/2024-08-flayer-judging/issues/214 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 Ruhum, h2134, kuprum, novaman33, rndquu, zzykxx
